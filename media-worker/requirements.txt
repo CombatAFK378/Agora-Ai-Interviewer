@@ -1,0 +1,20 @@
+# Web
+fastapi
+uvicorn[standard]
+pydantic
+pydantic-settings
+
+# HTTP to Sarvam / Deepgram
+requests
+
+# VAD
+numpy
+onnxruntime
+silero-vad
+# NOTE: torch + torchaudio (CPU build) are installed separately in the
+# Dockerfile from the PyTorch CPU index, before this file, so silero-vad's
+# torch dependency is already satisfied and pip won't pull the CUDA build.
+
+# Agora
+agora-python-server-sdk
+agora-token-builder

@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>968ms — Candidate Room (Phase 1)</title>
+  <!-- Agora Web SDK (audio transport). Bump the version here if needed. -->
+  <script src="https://download.agora.io/sdk/release/AgoraRTC_N-4.20.0.js"></script>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 640px; margin: 40px auto; padding: 0 16px; color: #1a1a1a; }
+    h1 { font-size: 1.4rem; }
+    button { font-size: 1rem; padding: 10px 20px; margin-right: 8px; border-radius: 8px; border: 1px solid #ccc; cursor: pointer; }
+    #join { background: #2563eb; color: white; border-color: #2563eb; }
+    #leave { background: #f3f4f6; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    #status { margin-top: 20px; font-weight: 600; }
+    #log { margin-top: 16px; background: #0b1021; color: #9ae6b4; padding: 12px; border-radius: 8px;
+           height: 240px; overflow-y: auto; font-family: ui-monospace, monospace; font-size: 0.8rem; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <h1>968ms — Candidate Room</h1>
+  <p>Phase 1 audio spine. Click <b>Join</b>, allow the mic, say a sentence, then pause.
+     The bot transcribes it and reads it back in a synthetic voice.</p>
+
+  <button id="join">Join Interview</button>
+  <button id="leave" disabled>Leave</button>
+
+  <div id="status">Idle.</div>
+  <div id="log"></div>
+
+  <script>
+    const joinBtn = document.getElementById("join");
+    const leaveBtn = document.getElementById("leave");
+    const statusEl = document.getElementById("status");
+    const logEl = document.getElementById("log");
+
+    let client = null;
+    let micTrack = null;
+
+    function log(msg) {
+      const t = new Date().toLocaleTimeString();
+      logEl.textContent += `[${t}] ${msg}\n`;
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+    function setStatus(s) { statusEl.textContent = s; }
+
+    async function join() {
+      joinBtn.disabled = true;
+      try {
+        setStatus("Starting session…");
+        log("POST /session/start");
+        const resp = await fetch("/session/start", { method: "POST" });
+        if (!resp.ok) throw new Error(`server: ${resp.status} ${await resp.text()}`);
+        const s = await resp.json();
+        log(`channel=${s.channel} uid=${s.uid}`);
+
+        client = AgoraRTC.createClient({ mode: "rtc", codec: "vp8" });
+
+        // Play the bot's audio when it publishes.
+        client.on("user-published", async (user, mediaType) => {
+          await client.subscribe(user, mediaType);
+          log(`subscribed to ${mediaType} from uid=${user.uid}`);
+          if (mediaType === "audio") {
+            user.audioTrack.play();
+            log("🔊 bot is speaking");
+          }
+        });
+
+        setStatus("Joining channel…");
+        await client.join(s.app_id, s.channel, s.token, s.uid);
+        log("joined Agora channel");
+
+        micTrack = await AgoraRTC.createMicrophoneAudioTrack();
+        await client.publish([micTrack]);
+        log("🎤 mic published — go ahead and talk");
+
+        setStatus("Live. Speak a sentence, then pause.");
+        leaveBtn.disabled = false;
+      } catch (e) {
+        log("ERROR: " + e.message);
+        setStatus("Failed — see log.");
+        joinBtn.disabled = false;
+      }
+    }
+
+    async function leave() {
+      leaveBtn.disabled = true;
+      try {
+        if (micTrack) { micTrack.stop(); micTrack.close(); micTrack = null; }
+        if (client) { await client.leave(); client = null; }
+        await fetch("/session/stop", { method: "POST" });
+        log("left channel");
+      } catch (e) {
+        log("ERROR on leave: " + e.message);
+      }
+      setStatus("Idle.");
+      joinBtn.disabled = false;
+    }
+
+    joinBtn.onclick = join;
+    leaveBtn.onclick = leave;
+  </script>
+</body>
+</html>

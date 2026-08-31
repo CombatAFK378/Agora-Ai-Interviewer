@@ -1,0 +1,18 @@
+# One command to build and run the media worker in its Linux container.
+# Secrets come from your local .env (see .env.example). Open http://localhost:8080
+#
+# Code is mounted as volumes + uvicorn --reload, so editing Python files takes
+# effect without rebuilding the image (only requirements changes need a rebuild).
+services:
+  media-worker:
+    build:
+      context: .
+      dockerfile: media-worker/Dockerfile
+    env_file: .env
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./media-worker:/app/media-worker
+      - ./shared:/app/shared
+      - ./web:/app/web
+    command: uvicorn main:app --host 0.0.0.0 --port 8080 --reload

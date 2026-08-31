@@ -1,0 +1,38 @@
+# Python
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Env & secrets
+.env
+*.env
+!.env.example
+
+# Models (downloaded weights)
+models/*.onnx
+models/*.jit
+
+# Node / web
+web/node_modules/
+web/dist/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Runtime
+*.log
+_tmp*/
+_ref/
+agora_rtc_log/
+
+# Agora SDK runtime cache
+agora_cache.db
+agoradns.dat
+
+# Claude Code local settings
+.claude/
