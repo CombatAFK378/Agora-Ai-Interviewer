@@ -36,6 +36,12 @@ class Settings(BaseSettings):
     # can't be interrupted, but echo can't derail the interview either.
     allow_bargein: bool = True
 
+    # Floor control (ARCHITECTURE §5). λ (coverage weight) ramps from start→end
+    # across the interview so late questions chase what we still don't know.
+    interview_time_budget_s: int = 1200
+    coverage_lambda_start: float = 0.5
+    coverage_lambda_end: float = 1.5
+
     # Phase 1 tunables
     vad_stop_secs: float = 0.2
     audio_sample_rate: int = 16000

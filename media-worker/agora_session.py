@@ -261,8 +261,8 @@ class AgoraSession:
         with self._out_lock:
             self._stream_open = False
 
-    def interrupt(self) -> int:
-        """Stop playback immediately. Returns bytes estimated already delivered.
+    def interrupt(self) -> tuple[int, int]:
+        """Stop playback immediately. Returns (delivered_bytes, synthesized_bytes).
 
         We can't un-push audio already handed to the SDK, so 'delivered' is a
         wall-clock estimate: playback is paced at real time, so the elapsed time
@@ -277,10 +277,11 @@ class AgoraSession:
             else:
                 elapsed = time.monotonic() - self._play_start
                 delivered = min(self._total_bytes, max(0, int(elapsed * self.sample_rate * 2)))
+            total = self._total_bytes
             self._speaking = False
             self._stream_open = False
             self._play_start = None
-        return delivered
+        return delivered, total
 
     def is_speaking(self) -> bool:
         return self._speaking

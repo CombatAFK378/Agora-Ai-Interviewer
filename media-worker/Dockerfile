@@ -1,5 +1,14 @@
-# Media worker runs on Linux because Agora's server SDK ships Linux binaries.
-# Python 3.12 chosen for the widest wheel availability (Agora SDK, torch, onnx).
+# ---- Stage 1: build the React (Vite) frontend ----
+FROM node:20-slim AS web
+WORKDIR /web
+COPY web/package.json ./
+RUN npm install
+COPY web/ ./
+RUN npm run build          # -> /web/dist
+
+# ---- Stage 2: the Python media worker ----
+# Runs on Linux because Agora's server SDK ships Linux binaries.
+# Python 3.12 for the widest wheel availability (Agora SDK, torch, onnx).
 FROM python:3.12-slim
 
 # libgomp1: needed by onnxruntime / torch. ca-certificates: TLS to the APIs.
@@ -19,13 +28,13 @@ RUN pip install --no-cache-dir -r media-worker/requirements.txt
 # App code
 COPY shared ./shared
 COPY media-worker ./media-worker
-COPY web ./web
-# models/ (download scripts, README). Weights are git-ignored and mounted in via
-# docker-compose, so they aren't baked into the image.
 COPY models ./models
+# Built frontend from stage 1 (the worker serves this at "/")
+COPY --from=web /web/dist ./web/dist
 
 # So `import shared...` works; local modules resolve from the media-worker cwd.
 ENV PYTHONPATH=/app
+ENV WEB_DIR=/app/web/dist
 WORKDIR /app/media-worker
 
 EXPOSE 8080

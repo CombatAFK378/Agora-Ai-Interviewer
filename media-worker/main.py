@@ -1,24 +1,29 @@
-"""Media worker HTTP surface (Phase 2).
+"""Media worker HTTP surface (Phase 3).
 
 Endpoints:
-  GET  /               -> serves the candidate web page
-  GET  /health         -> liveness check
-  POST /session/start  -> mints Agora tokens, joins the bot, starts the pipeline,
-                          and returns what the browser needs to join the channel
+  GET  /                 -> serves the candidate web page (React panel room)
+  GET  /health           -> liveness check
+  GET  /panel            -> the five interviewers' roster (for the tiles)
+  POST /session/start    -> mints Agora tokens, joins the bot, starts the pipeline
+  POST /session/interrupt-> manual barge-in
+  POST /session/stop     -> tear down
+  WS   /session/events   -> live speaker signals (who's talking) + captions
 
-We still run exactly one interview session per process (multi-tenant workers
-come later). Phase 2 swaps the echo pipeline for one LLM-backed interviewer.
+One interview per process still. Phase 3 makes it a five-agent panel and streams
+speaker signals to the UI over a WebSocket (our stand-in for Agora RTM).
 """
+import asyncio
 import logging
 import os
 import uuid
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.staticfiles import StaticFiles
 
 from shared.config import get_settings
 from shared.agora_token import build_rtc_token
 from shared.models import SessionStartResponse
+from shared import prompts
 
 from agora_session import AgoraSession
 from pipeline import InterviewPipeline
@@ -36,12 +41,79 @@ app = FastAPI(title="968ms media worker")
 _session: AgoraSession | None = None
 _pipeline: InterviewPipeline | None = None
 
-WEB_DIR = os.environ.get("WEB_DIR", os.path.join(os.path.dirname(__file__), "..", "web"))
+# The built Vite app (dist/). In Docker this is set to /app/web/dist. For local
+# frontend dev, run `npm run dev` instead (Vite serves the app and proxies here).
+WEB_DIR = os.environ.get(
+    "WEB_DIR", os.path.join(os.path.dirname(__file__), "..", "web", "dist")
+)
 
 
-@app.get("/")
-def index():
-    return FileResponse(os.path.join(WEB_DIR, "index.html"))
+class EventBroker:
+    """Bridges pipeline events (emitted from worker threads) to WebSocket clients
+    (async). Each connection gets a queue; publish() hops onto the event loop
+    thread-safely and drops events for a slow/full consumer rather than blocking."""
+
+    def __init__(self):
+        self._subs: set[asyncio.Queue] = set()
+        self._loop: asyncio.AbstractEventLoop | None = None
+
+    def bind_loop(self, loop: asyncio.AbstractEventLoop):
+        self._loop = loop
+
+    def subscribe(self) -> asyncio.Queue:
+        q: asyncio.Queue = asyncio.Queue(maxsize=128)
+        self._subs.add(q)
+        return q
+
+    def unsubscribe(self, q: asyncio.Queue):
+        self._subs.discard(q)
+
+    def publish(self, event: dict):
+        loop = self._loop
+        if loop is None:
+            return
+        for q in list(self._subs):
+            loop.call_soon_threadsafe(self._offer, q, event)
+
+    @staticmethod
+    def _offer(q: asyncio.Queue, event: dict):
+        try:
+            q.put_nowait(event)
+        except asyncio.QueueFull:
+            pass
+
+
+_broker = EventBroker()
+
+
+def _panel_roster() -> list[dict]:
+    return [
+        {"id": a, "name": prompts.AGENTS[a].name, "title": prompts.AGENTS[a].title}
+        for a in prompts.PANEL_IDS
+    ]
+
+
+@app.get("/panel")
+def panel():
+    return {"agents": _panel_roster()}
+
+
+@app.websocket("/session/events")
+async def session_events(ws: WebSocket):
+    await ws.accept()
+    _broker.bind_loop(asyncio.get_running_loop())
+    q = _broker.subscribe()
+    try:
+        await ws.send_json({"type": "panel", "agents": _panel_roster()})
+        while True:
+            event = await q.get()
+            await ws.send_json(event)
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        logger.exception("events websocket error")
+    finally:
+        _broker.unsubscribe(q)
 
 
 @app.get("/health")
@@ -96,6 +168,8 @@ def session_start():
     )
     # The opener fires when the candidate joins the channel.
     session.set_on_user_joined(pipeline.on_candidate_joined)
+    # Stream speaker signals / captions to the UI over the events WebSocket.
+    pipeline.on_event = _broker.publish
 
     session.start()
     pipeline.start()
@@ -134,3 +208,13 @@ def _teardown():
     if _session is not None:
         _session.stop()
         _session = None
+
+
+# Serve the built React app (dist/) at "/". Mounted LAST so the API routes and
+# the events WebSocket above take precedence; the SPA catches everything else.
+# Absent in local frontend-dev mode (use `npm run dev`), so guard on existence.
+if os.path.isdir(WEB_DIR):
+    app.mount("/", StaticFiles(directory=WEB_DIR, html=True), name="web")
+else:
+    logger.warning("WEB_DIR %s not found; not serving the frontend "
+                   "(run `cd web && npm run dev` for the React app)", WEB_DIR)

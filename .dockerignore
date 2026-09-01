@@ -1,0 +1,14 @@
+# Keep the build context small and reproducible.
+**/__pycache__/
+*.pyc
+venv/
+.venv/
+.git/
+.env
+web/node_modules/
+web/dist/
+models/*.onnx
+models/*.jit
+agora_rtc_log/
+*.log
+.DS_Store

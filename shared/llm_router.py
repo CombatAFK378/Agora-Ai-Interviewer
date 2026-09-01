@@ -157,6 +157,9 @@ def _call(
 
     data = resp.json()
     try:
-        return data["choices"][0]["message"]["content"].strip()
+        content = data["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError) as e:
         raise ValueError(f"unexpected LLM response shape: {data}") from e
+    if not content:  # some models return null/empty content on a refusal/error
+        raise ValueError("empty content from model")
+    return content.strip()

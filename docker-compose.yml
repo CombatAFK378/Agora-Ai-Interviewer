@@ -12,9 +12,11 @@ services:
     ports:
       - "8080:8080"
     volumes:
+      # Backend code is mounted for --reload. The frontend is NOT mounted: it's
+      # built into the image (dist/). For live frontend dev run `cd web && npm run
+      # dev` (Vite :5173 proxies the API to this worker).
       - ./media-worker:/app/media-worker
       - ./shared:/app/shared
-      - ./web:/app/web
       # Downloaded Smart Turn weights (see models/README.md). Mounting keeps the
       # large .onnx on the host so it survives rebuilds and isn't baked in.
       - ./models:/app/models

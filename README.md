@@ -2,7 +2,16 @@
 
 An adaptive AI interview panel. See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design.
 
-This repo is being built **phase by phase**. Current status: **Phase 2 — One interviewer.**
+This repo is being built **phase by phase**. Current status: **Phase 3 — The panel.**
+
+Five AI interviewers (Maya · Ethan · Sophia · Nina · Liam) with distinct prompts
+and voices, a silent Orchestrator that opens the session, parallel bid calls each
+turn, and **deterministic floor control** (`priority = interest × (1+λ·gap) ×
+recency`) that picks who speaks. The React candidate room shows five tiles and
+lights up whoever's talking (speaker signals over a WebSocket), with live
+captions, a push-to-talk Interrupt button, and Agora AI noise suppression on the
+mic. Verified: a technically-correct answer with no customer impact routes to
+Product (the PS11 scenario).
 
 ---
 
@@ -47,11 +56,33 @@ still runs natively on Windows. Everything else (config, tokens) is plain Python
 ## Layout
 
 ```
-media-worker/   FastAPI app: Agora join, VAD, STT, TTS, echo pipeline (runs in Docker)
-web/            Candidate web page (Agora Web SDK)  — served by the media worker
-shared/         Config loader, Agora token builder, Pydantic models
-venv/           Local Python venv (Windows) for tooling/tests
+media-worker/   FastAPI app: Agora join, VAD, Smart Turn, STT, TTS, panel turn loop (Docker)
+web/            React + Vite candidate room (src/App.jsx). Built to web/dist,
+                which the media worker serves at "/".
+shared/         Config, tokens, models, prompts (agents), competencies,
+                orchestrator (floor control + parallel bids), LLM router
+models/         Downloaded ONNX weights (Smart Turn)
 ```
+
+## Frontend (React + Vite)
+
+The candidate room is a Vite React app in `web/`. Two ways to run it:
+
+- **Full app (what evaluators run):** `docker compose up --build`. The Docker
+  build compiles the React app and the worker serves it — open
+  **http://localhost:8080**. One origin, one command.
+- **Live frontend dev:** run the backend in Docker (above) and, separately,
+  `cd web && npm install && npm run dev`. Vite serves the app on **:5173** with
+  hot reload and proxies the API + events WebSocket to the worker on :8080.
+
+## Deploying (one repo, one URL)
+
+The media worker must run as a long-lived Linux container (Agora's native SDK +
+torch/ONNX models), so it can't go on Vercel/Netlify. The clean pattern: the
+worker serves the built React app **and** the API from one origin, so you deploy
+**one container** to Render / Railway / Fly.io (or a VM) and get a single HTTPS
+URL. Needs ≥1–2 GB RAM, WebSocket support, and the API keys as env vars. HTTPS is
+required anyway — browsers only grant mic access over https (localhost aside).
 
 ---
 
