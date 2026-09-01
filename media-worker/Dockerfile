@@ -20,6 +20,9 @@ RUN pip install --no-cache-dir -r media-worker/requirements.txt
 COPY shared ./shared
 COPY media-worker ./media-worker
 COPY web ./web
+# models/ (download scripts, README). Weights are git-ignored and mounted in via
+# docker-compose, so they aren't baked into the image.
+COPY models ./models
 
 # So `import shared...` works; local modules resolve from the media-worker cwd.
 ENV PYTHONPATH=/app

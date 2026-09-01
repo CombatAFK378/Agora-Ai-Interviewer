@@ -15,4 +15,7 @@ services:
       - ./media-worker:/app/media-worker
       - ./shared:/app/shared
       - ./web:/app/web
+      # Downloaded Smart Turn weights (see models/README.md). Mounting keeps the
+      # large .onnx on the host so it survives rebuilds and isn't baked in.
+      - ./models:/app/models
     command: uvicorn main:app --host 0.0.0.0 --port 8080 --reload

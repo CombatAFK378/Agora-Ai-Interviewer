@@ -16,8 +16,28 @@ class Settings(BaseSettings):
     sarvam_api_key: str = ""
     deepgram_api_key: str = ""
 
+    # LLM. Every model call goes through the shared router in
+    # shared/llm_router.py; never hardcode a model at a call site. Model ids may
+    # carry a provider prefix ("groq:" / "openrouter:"); unprefixed ids default
+    # to OpenRouter. Both providers are OpenAI-compatible.
+    openrouter_api_key: str = ""
+    groq_api_key: str = ""
+    llm_fast_model: str = "groq:openai/gpt-oss-120b"      # candidate is waiting
+    llm_reasoning_model: str = "openrouter:nvidia/nemotron-3-ultra-550b-a55b:free"
+    llm_fallback_chain: str = ""                          # comma-separated ids
+
+    # Smart Turn v3.1 end-of-turn detection
+    smart_turn_model_path: str = "models/smart-turn-v3.1.onnx"
+    smart_turn_threshold: float = 0.5
+
+    # Barge-in (interrupt the agent by talking over it). Needs the candidate on
+    # headphones — otherwise the agent's own voice echoes into the mic and
+    # false-triggers it. Set false for robust half-duplex on speakers: the agent
+    # can't be interrupted, but echo can't derail the interview either.
+    allow_bargein: bool = True
+
     # Phase 1 tunables
-    vad_stop_secs: float = 0.6
+    vad_stop_secs: float = 0.2
     audio_sample_rate: int = 16000
     media_worker_port: int = 8080
 
@@ -26,6 +46,11 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
     )
+
+    @property
+    def fallback_models(self) -> list[str]:
+        """Parsed fallback chain: primary tried first, then these in order."""
+        return [m.strip() for m in self.llm_fallback_chain.split(",") if m.strip()]
 
 
 @lru_cache

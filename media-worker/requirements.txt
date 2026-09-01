@@ -6,11 +6,17 @@ pydantic-settings
 
 # HTTP to Sarvam / Deepgram
 requests
+# WebSocket client for Deepgram streaming TTS (low time-to-first-audio)
+websocket-client
 
 # VAD
 numpy
 onnxruntime
 silero-vad
+
+# Smart Turn v3.1: Whisper-Tiny encoder end-of-turn model. transformers supplies
+# WhisperFeatureExtractor (the exact log-mel frontend the model expects).
+transformers
 # NOTE: torch + torchaudio (CPU build) are installed separately in the
 # Dockerfile from the PyTorch CPU index, before this file, so silero-vad's
 # torch dependency is already satisfied and pip won't pull the CUDA build.

@@ -4,8 +4,9 @@ This is deliberately thin. It does two things:
   - EAR: receives the candidate's PCM and drops it on `inbound` (a thread-safe
     queue) for the pipeline to consume. The SDK fires this on its own native
     thread, so we do NO slow work here - just enqueue and return.
-  - MOUTH: `enqueue_playback()` accepts synthesized PCM, and a background thread
-    paces it out to Agora at real-time using the SDK's flow-control check.
+  - MOUTH: `speak()` accepts synthesized PCM for one agent turn, and a background
+    thread paces it out to Agora at ~real time. `interrupt()` stops playback on
+    barge-in and reports how much was already delivered.
 
 One AgoraService exists per process (an SDK requirement). One AgoraSession =
 one channel connection.
@@ -14,7 +15,6 @@ import logging
 import queue
 import threading
 import time
-from collections import deque
 from typing import Optional
 
 from agora.rtc.agora_service import (
@@ -41,11 +41,17 @@ from agora.rtc.agora_base import (
 
 logger = logging.getLogger(__name__)
 
-# Outbound audio is pushed in large slices so the SDK plays it back seamlessly.
-# Small slices leave audible gaps between pushes (each push waits for the
-# previous to fully drain). Agora's own examples push up to ~5 s at once, so we
-# use a 5 s slice: short replies become a single gap-free push.
-PLAYBACK_CHUNK_BYTES = 160000  # 80000 samples * 2 bytes = 5 s @ 16 kHz
+# Outbound audio is streamed in ~0.5 s chunks, paced at roughly real time so the
+# SDK's buffer stays just barely ahead (no starvation gaps) while never getting
+# more than one chunk ahead. That bound matters for interruption (ARCHITECTURE
+# §4): when we stop feeding on barge-in, at most ~0.5 s of already-buffered audio
+# can still play out. Phase 1 used one big 5 s slice for smoothness; that made
+# barge-in feel broken (up to 5 s of the agent kept talking), so we trade a
+# slightly finer push cadence for responsive interruption.
+#
+# If playback ever sounds choppy, raise PLAYBACK_CHUNK_SECS (at the cost of
+# interruption latency) or nudge the pacing lead in _push_loop.
+PLAYBACK_CHUNK_SECS = 0.5
 
 _service: Optional[AgoraService] = None
 _service_lock = threading.Lock()
@@ -67,6 +73,10 @@ def get_agora_service(app_id: str) -> AgoraService:
 
 
 class _ConnObserver(IRTCConnectionObserver):
+    def __init__(self, session: "AgoraSession"):
+        super().__init__()
+        self._session = session
+
     def on_connected(self, conn, info, reason):
         logger.info(f"bot connected (uid={info.internal_uid})")
 
@@ -78,6 +88,7 @@ class _ConnObserver(IRTCConnectionObserver):
 
     def on_user_joined(self, conn, user_id):
         logger.info(f"remote user joined: {user_id}")
+        self._session._on_remote_join(user_id)
 
     def on_aiqos_capability_missing(self, conn, recommend_audio_scenario):
         return recommend_audio_scenario
@@ -116,17 +127,42 @@ class _InboundAudioObserver(IAudioFrameObserver):
 
 
 class AgoraSession:
-    def __init__(self, app_id: str, channel: str, bot_uid: int, token: str, sample_rate: int = 16000):
+    def __init__(
+        self,
+        app_id: str,
+        channel: str,
+        bot_uid: int,
+        token: str,
+        sample_rate: int = 16000,
+        on_user_joined=None,
+    ):
         self.app_id = app_id
         self.channel = channel
         self.bot_uid = bot_uid
         self.token = token
         self.sample_rate = sample_rate
+        # Called (once per join) when a remote user appears — the pipeline uses
+        # it to deliver the scripted opener after the candidate has joined.
+        self._on_user_joined = on_user_joined
 
         self.inbound: "queue.Queue[bytes]" = queue.Queue()
-        self._outbound: deque[bytearray] = deque()
+        # One continuous PCM buffer. Producers (streaming TTS) append audio in
+        # whatever chunk sizes they arrive in; the push loop drains fixed ~0.5 s
+        # slices, so playback pacing is independent of TTS chunk sizes.
+        self._buffer = bytearray()
         self._out_lock = threading.Lock()
         self._stop = threading.Event()
+        self._chunk_bytes = int(self.sample_rate * 2 * PLAYBACK_CHUNK_SECS)
+
+        # Playback state for the current agent turn. Audio is streamed in:
+        # begin_speech() opens the stream, add_speech() appends synthesized
+        # chunks as they arrive (sentence by sentence), end_speech() closes it.
+        # _stream_open keeps playback "live" through the gaps while later
+        # sentences are still being synthesized.
+        self._speaking = False
+        self._stream_open = False
+        self._total_bytes = 0        # bytes of PCM appended so far this turn
+        self._play_start: Optional[float] = None  # monotonic time first chunk pushed
 
         self._conn = None
         self._push_thread: Optional[threading.Thread] = None
@@ -169,7 +205,7 @@ class AgoraSession:
         )
 
         self._conn = svc.create_rtc_connection(conn_cfg, pub_cfg)
-        self._conn_observer = _ConnObserver()
+        self._conn_observer = _ConnObserver(self)
         self._conn.register_observer(self._conn_observer)
         self._conn.connect(self.token, self.channel, str(self.bot_uid))
 
@@ -192,31 +228,119 @@ class AgoraSession:
     def _on_inbound_pcm(self, pcm: bytes):
         self.inbound.put_nowait(pcm)
 
-    def enqueue_playback(self, pcm_bytes: bytes):
-        """Queue synthesized speech to be spoken into the channel.
+    def set_on_user_joined(self, callback):
+        """Register the remote-join callback (set before start())."""
+        self._on_user_joined = callback
 
-        Chunks are stored as bytearray (mutable): the SDK pushes them via
-        ctypes.from_buffer(), which rejects immutable bytes.
+    def _on_remote_join(self, user_id):
+        if self._on_user_joined is not None:
+            try:
+                self._on_user_joined(user_id)
+            except Exception:
+                logger.exception("on_user_joined handler failed")
+
+    def begin_speech(self):
+        """Start a new streamed agent turn, replacing anything still playing."""
+        with self._out_lock:
+            self._buffer = bytearray()
+            self._total_bytes = 0
+            self._play_start = None
+            self._speaking = True
+            self._stream_open = True
+
+    def add_speech(self, pcm_bytes: bytes):
+        """Append a synthesized chunk to the current turn's playback buffer."""
+        with self._out_lock:
+            if not self._speaking:  # interrupted mid-stream — drop late audio
+                return
+            self._buffer.extend(pcm_bytes)
+            self._total_bytes += len(pcm_bytes)
+
+    def end_speech(self):
+        """No more audio will be appended to this turn."""
+        with self._out_lock:
+            self._stream_open = False
+
+    def interrupt(self) -> int:
+        """Stop playback immediately. Returns bytes estimated already delivered.
+
+        We can't un-push audio already handed to the SDK, so 'delivered' is a
+        wall-clock estimate: playback is paced at real time, so the elapsed time
+        since the first chunk went out maps to bytes heard (capped at the total).
+        Slightly over-counts by the buffer depth (~<=0.5 s) — good enough to cite
+        what the candidate actually heard for the truncation point.
         """
         with self._out_lock:
-            for i in range(0, len(pcm_bytes), PLAYBACK_CHUNK_BYTES):
-                self._outbound.append(bytearray(pcm_bytes[i : i + PLAYBACK_CHUNK_BYTES]))
+            self._buffer = bytearray()
+            if self._play_start is None:
+                delivered = 0
+            else:
+                elapsed = time.monotonic() - self._play_start
+                delivered = min(self._total_bytes, max(0, int(elapsed * self.sample_rate * 2)))
+            self._speaking = False
+            self._stream_open = False
+            self._play_start = None
+        return delivered
+
+    def is_speaking(self) -> bool:
+        return self._speaking
+
+    def speaking_elapsed(self) -> float:
+        """Seconds since the first audio of the current turn actually went out
+        (0 if nothing has played yet). Used for the barge-in grace period."""
+        with self._out_lock:
+            if self._play_start is None:
+                return 0.0
+            return time.monotonic() - self._play_start
 
     def _push_loop(self):
         while not self._stop.is_set():
             chunk = None
-            if self._conn is not None and self._conn.is_push_to_rtc_completed():
-                with self._out_lock:
-                    if self._outbound:
-                        chunk = self._outbound.popleft()
+            with self._out_lock:
+                if self._speaking and self._buffer:
+                    have = len(self._buffer)
+                    # Take a full slice; take a partial tail only once the stream
+                    # is closed (otherwise wait for more so we don't push slivers).
+                    if have >= self._chunk_bytes:
+                        take = self._chunk_bytes
+                    elif not self._stream_open:
+                        take = have
+                    else:
+                        take = 0
+                    if take:
+                        chunk = bytearray(self._buffer[:take])
+                        del self._buffer[:take]
+                        if self._play_start is None:
+                            self._play_start = time.monotonic()
+
             if chunk is not None:
                 try:
                     self._conn.push_audio_pcm_data(chunk, self.sample_rate, 1)
                 except Exception:
                     logger.exception("push_audio_pcm_data failed")
-                time.sleep(0.02)
+                # Pace just under real time (by the slice's actual duration) so the
+                # SDK buffer stays ~one chunk ahead: gap-free, but never so far
+                # ahead that interruption lags.
+                time.sleep((len(chunk) / (self.sample_rate * 2)) * 0.9)
             else:
-                time.sleep(0.04)
+                self._maybe_finish_playback()
+                time.sleep(0.02)
+
+    def _maybe_finish_playback(self):
+        """Mark playback done once the last pushed audio has had time to play."""
+        with self._out_lock:
+            # While the stream is open, an empty buffer just means the next
+            # sentence is still being synthesized — stay "speaking".
+            if not self._speaking or self._buffer or self._stream_open:
+                return
+            if self._play_start is None:
+                # Nothing was ever pushed (e.g. empty turn) — just finish.
+                self._speaking = False
+                return
+            played = time.monotonic() - self._play_start
+            if played >= self._total_bytes / (self.sample_rate * 2) + 0.3:
+                self._speaking = False
+                self._play_start = None
 
     def stop(self):
         self._stop.set()

@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>968ms — Candidate Room (Phase 1)</title>
+  <title>968ms — Candidate Room (Phase 2)</title>
   <!-- Agora Web SDK (audio transport). Bump the version here if needed. -->
   <script src="https://download.agora.io/sdk/release/AgoraRTC_N-4.20.0.js"></script>
   <style>
@@ -14,17 +14,42 @@
     #leave { background: #f3f4f6; }
     button:disabled { opacity: 0.5; cursor: not-allowed; }
     #status { margin-top: 20px; font-weight: 600; }
+    .howto { margin-top: 16px; padding: 14px 16px; border: 1px solid #d1d5db;
+             border-radius: 10px; background: #f9fafb; line-height: 1.5; }
+    .howto b { color: #111827; }
+    .howto .mic { color: #2563eb; }
+    .howto .cut { color: #b45309; }
+    #interruptWrap { margin-top: 18px; padding: 14px; border: 2px dashed #f59e0b;
+                     border-radius: 12px; background: #fffbeb; text-align: center; }
+    #interrupt { font-size: 1.15rem; padding: 14px 28px; background: #f59e0b;
+                 color: #1a1a1a; border-color: #d97706; font-weight: 700; }
+    #interrupt:not(:disabled):hover { background: #fbbf24; }
+    #interruptHint { margin-top: 8px; font-size: 0.85rem; color: #92400e; }
     #log { margin-top: 16px; background: #0b1021; color: #9ae6b4; padding: 12px; border-radius: 8px;
            height: 240px; overflow-y: auto; font-family: ui-monospace, monospace; font-size: 0.8rem; white-space: pre-wrap; }
   </style>
 </head>
 <body>
   <h1>968ms — Candidate Room</h1>
-  <p>Phase 1 audio spine. Click <b>Join</b>, allow the mic, say a sentence, then pause.
-     The bot transcribes it and reads it back in a synthetic voice.</p>
+  <p>Phase 2. Click <b>Join</b> and allow the mic. The interviewer greets you and
+     asks the first question — just answer out loud and pause when you're done.</p>
+
+  <div class="howto">
+    <b>How the two controls work:</b><br />
+    🎤 <span class="mic"><b>Your mic</b></span> is for <b>answering</b>. Speak after
+    the interviewer finishes, then pause — it will not cut her off.<br />
+    ✋ <span class="cut"><b>Interrupt button</b></span> is the <b>only</b> way to
+    cut in while she's still talking. Click it, then speak.
+  </div>
 
   <button id="join">Join Interview</button>
   <button id="leave" disabled>Leave</button>
+
+  <div id="interruptWrap">
+    <button id="interrupt" disabled>✋ Interrupt the interviewer</button>
+    <div id="interruptHint">Click this to cut in while she's speaking, then talk.
+      Your normal mic never interrupts her.</div>
+  </div>
 
   <div id="status">Idle.</div>
   <div id="log"></div>
@@ -32,6 +57,7 @@
   <script>
     const joinBtn = document.getElementById("join");
     const leaveBtn = document.getElementById("leave");
+    const interruptBtn = document.getElementById("interrupt");
     const statusEl = document.getElementById("status");
     const logEl = document.getElementById("log");
 
@@ -71,12 +97,17 @@
         await client.join(s.app_id, s.channel, s.token, s.uid);
         log("joined Agora channel");
 
-        micTrack = await AgoraRTC.createMicrophoneAudioTrack();
+        // AEC/ANS/AGC on: cancels the bot's voice coming back through the
+        // speakers so it doesn't false-trigger a barge-in. Headphones help too.
+        micTrack = await AgoraRTC.createMicrophoneAudioTrack({
+          AEC: true, ANS: true, AGC: true,
+        });
         await client.publish([micTrack]);
-        log("🎤 mic published — go ahead and talk");
+        log("🎤 mic published — the interviewer will speak first");
 
-        setStatus("Live. Speak a sentence, then pause.");
+        setStatus("Live. The interviewer will greet you shortly.");
         leaveBtn.disabled = false;
+        interruptBtn.disabled = false;
       } catch (e) {
         log("ERROR: " + e.message);
         setStatus("Failed — see log.");
@@ -86,6 +117,7 @@
 
     async function leave() {
       leaveBtn.disabled = true;
+      interruptBtn.disabled = true;
       try {
         if (micTrack) { micTrack.stop(); micTrack.close(); micTrack = null; }
         if (client) { await client.leave(); client = null; }
@@ -98,8 +130,20 @@
       joinBtn.disabled = false;
     }
 
+    async function interrupt() {
+      try {
+        const resp = await fetch("/session/interrupt", { method: "POST" });
+        const r = await resp.json();
+        log(r.interrupted ? "✋ interrupted — go ahead and speak"
+                          : "✋ (nothing to interrupt right now)");
+      } catch (e) {
+        log("ERROR on interrupt: " + e.message);
+      }
+    }
+
     joinBtn.onclick = join;
     leaveBtn.onclick = leave;
+    interruptBtn.onclick = interrupt;
   </script>
 </body>
 </html>
