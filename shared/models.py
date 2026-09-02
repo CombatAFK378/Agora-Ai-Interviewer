@@ -68,3 +68,63 @@ class Claim(BaseModel):
     noticed_by: list[str] = Field(default_factory=list)  # agent ids
     contradicts_claim_id: str | None = None
     ts: float = Field(default_factory=time.time)
+
+
+# Conviction (ARCHITECTURE §6) — computed deterministically at lock, never asked.
+CONVICTION_STRONG = "STRONG"
+CONVICTION_NEUTRAL = "NEUTRAL"
+
+
+class AgentScore(BaseModel):
+    """One interviewer's locked score, written once at the final bell (§3, §6).
+
+    Immutable after lock. `evidence` references the claim ids / turns behind the
+    score so every number links back to the transcript (§13.8).
+    """
+    interview_id: str
+    agent_id: str
+    competency_scores: dict[str, float] = Field(default_factory=dict)  # key -> 0..1
+    overall: float = 0.5                       # 0..1
+    conviction: str = CONVICTION_NEUTRAL       # STRONG | NEUTRAL (deterministic)
+    evidence: list[str] = Field(default_factory=list)   # claim ids / "turn N"
+    rationale: str = ""
+
+
+class DebateStatement(BaseModel):
+    """One statement in the sequential debate (§6). A STRONG agent's MOVE is
+    rejected in code (`rejected=True`), keeping its locked score."""
+    interview_id: str
+    round: int
+    agent_id: str
+    statement: str
+    action: str                                # HOLD | MOVE
+    score_before: float
+    score_after: float
+    rejected: bool = False
+
+
+# Panel recommendation (§6). The split is the output — never an average (§13.6).
+REC_PROCEED = "PROCEED"
+REC_PROCEED_FLAGGED = "PROCEED_FLAGGED"
+REC_INSUFFICIENT = "INSUFFICIENT_SIGNAL"
+REC_DECLINE = "DECLINE"
+
+
+class PanelConclusion(BaseModel):
+    """The Orchestrator's final read of the panel (§6). Reports the split; it
+    does not out-vote anyone."""
+    interview_id: str
+    recommendation: str
+    headline: str                              # the split, in words
+    unresolved: list[dict] = Field(default_factory=list)  # [{item, evidence}]
+    reasoning: str = ""
+
+
+class InterviewReport(BaseModel):
+    """The locked, hashable record produced at the final bell (§6)."""
+    interview_id: str
+    scores: list[AgentScore]
+    debate: list[DebateStatement]
+    conclusion: PanelConclusion
+    coverage: dict[str, float] = Field(default_factory=dict)
+    locked_hash: str = ""                      # SHA-256 of the canonical record

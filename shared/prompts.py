@@ -257,3 +257,97 @@ def build_bid_prompt(agent_id: str, transcript: list[TranscriptTurn]) -> list[di
     convo = _flatten_transcript(transcript) or "(nothing said yet)"
     user = f"Conversation so far:\n\n{convo}\n\nNow output ONLY your JSON."
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+# ---- Phase 5: lock (scoring), debate, conclusion -------------------------
+
+_SCORING_RULES = (
+    "\n\nThe interview is over. Score the candidate on your competencies [{comps}] — "
+    "but ONLY the ones you actually have evidence for from the transcript/ledger.\n"
+    "- For a competency that WAS explored: 0.0 (probed and clearly weak) to 1.0 "
+    "(strong, well-evidenced). A low score means they were asked and fell short.\n"
+    "- For a competency that never came up or has no evidence: OMIT it entirely. "
+    "Do NOT score it low — 'not asked' is NOT the same as 'weak'.\n"
+    "- Set `overall` from only what you could actually assess. If you have "
+    "essentially no evidence in your area, return an empty competency_scores, an "
+    "`overall` of 0.5, and say 'not assessed' in the rationale.\n"
+    "Be honest: don't invent strengths the candidate never showed, but don't punish "
+    "topics that simply weren't explored. Cite the claim ids / turns you used.\n"
+    "Output ONLY compact JSON:\n"
+    '{{"competency_scores": {{"<key>": <0-1>}}, "overall": <0-1>, '
+    '"evidence": ["<claim id or \'turn N\'>"], "rationale": "<= 2 sentences"}}'
+)
+
+_DEBATE_RULES = (
+    "\n\nThe panel's scores are now revealed. In ONE or two sentences, react to the "
+    "spread and either HOLD your score, or MOVE it if another interviewer's evidence "
+    "genuinely changes your view — never move just to agree. Your conviction is "
+    "{conviction}.\n"
+    "Output ONLY compact JSON:\n"
+    '{{"action": "HOLD" or "MOVE", "statement": "<= 2 sentences, addressed to the '
+    'panel>", "new_overall": <0-1>}}'
+)
+
+_CONCLUSION_RULES = (
+    "\n\nYou are the panel chair writing the final conclusion. Report the SPLIT — "
+    "NEVER average the scores; the disagreement is the signal. Choose a "
+    "recommendation:\n"
+    "- PROCEED — clear, well-evidenced yes.\n"
+    "- PROCEED_FLAGGED — yes, with specific reservations to check.\n"
+    "- INSUFFICIENT_SIGNAL — the interview was short or thinly evidenced; too little "
+    "was actually probed to judge fairly. Recommend a human screen. This is the "
+    "right call for a partial interview — do NOT DECLINE merely for missing or "
+    "un-probed evidence.\n"
+    "- DECLINE — ONLY when the candidate was genuinely probed and demonstrably fell "
+    "short, with evidence of weakness (not just absence of evidence).\n"
+    "List unresolved items a human should verify, each with its turn/claim evidence. "
+    "You report what the panel concluded; you do not out-vote anyone.\n"
+    "Output ONLY compact JSON:\n"
+    '{{"recommendation": "PROCEED|PROCEED_FLAGGED|INSUFFICIENT_SIGNAL|DECLINE", '
+    '"headline": "<one line capturing the split>", '
+    '"unresolved": [{{"item": "...", "evidence": "turn N / claim id"}}], '
+    '"reasoning": "<one short paragraph>"}}'
+)
+
+
+def build_scoring_prompt(agent_id: str, transcript: list[TranscriptTurn], claims: list) -> list[dict]:
+    """Blind scoring prompt (§6): full transcript + the ledger evidence in this
+    agent's area. Each agent scores independently, on its own competencies."""
+    agent = AGENTS[agent_id]
+    my_comps = _agent_competencies(agent_id)
+    convo = _flatten_transcript(transcript) or "(no transcript)"
+    ev_lines = [
+        f"- [{c.id}] ({c.competency}, {c.status}, strength {c.strength}) {c.text}"
+        for c in claims if c.competency in my_comps
+    ]
+    evidence = "\n".join(ev_lines) or "(no claims recorded in your area)"
+    system = agent.persona + _SCORING_RULES.format(comps=", ".join(my_comps) or "general")
+    user = (f"Full interview transcript:\n\n{convo}\n\n"
+            f"Evidence from the ledger in your area:\n{evidence}\n\n"
+            "Score now. Output ONLY the JSON.")
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+def build_debate_prompt(agent_id: str, scores_summary: str, statements_so_far: list[dict],
+                        conviction: str) -> list[dict]:
+    """Sequential debate prompt (§6): all five locked scores + statements so far."""
+    agent = AGENTS[agent_id]
+    prior = "\n".join(
+        f"- {AGENTS[s['agent']].name}: {s['statement']}" for s in statements_so_far
+    ) or "(you are speaking first)"
+    system = agent.persona + _DEBATE_RULES.format(conviction=conviction)
+    user = (f"All five locked overall scores:\n{scores_summary}\n\n"
+            f"Statements so far this round:\n{prior}\n\n"
+            "State your position. Output ONLY the JSON.")
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+def build_conclusion_prompt(scores_summary: str, debate_summary: str,
+                            coverage_summary: str) -> list[dict]:
+    """Final conclusion prompt (§6), spoken by the Orchestrator chair."""
+    system = ORCHESTRATOR.persona + _CONCLUSION_RULES
+    user = (f"Locked scores:\n{scores_summary}\n\n"
+            f"Debate:\n{debate_summary}\n\n"
+            f"Competency coverage:\n{coverage_summary}\n\n"
+            "Write the panel's conclusion. Output ONLY the JSON.")
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]

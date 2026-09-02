@@ -22,8 +22,8 @@ from fastapi.staticfiles import StaticFiles
 
 from shared.config import get_settings
 from shared.agora_token import build_rtc_token
-from shared.models import SessionStartResponse
-from shared import prompts
+from shared.models import InterviewReport, SessionStartResponse
+from shared import prompts, scoring
 
 from agora_session import AgoraSession
 from pipeline import InterviewPipeline
@@ -40,6 +40,7 @@ app = FastAPI(title="968ms media worker")
 # Held for the lifetime of the single active session.
 _session: AgoraSession | None = None
 _pipeline: InterviewPipeline | None = None
+_report: InterviewReport | None = None   # last locked report (Phase 5)
 
 # The built Vite app (dist/). In Docker this is set to /app/web/dist. For local
 # frontend dev, run `npm run dev` instead (Vite serves the app and proxies here).
@@ -192,6 +193,29 @@ def session_interrupt():
         raise HTTPException(409, "no active session")
     interrupted = _pipeline.request_interrupt()
     return {"status": "ok", "interrupted": interrupted}
+
+
+@app.post("/session/conclude", response_model=InterviewReport)
+def session_conclude():
+    """Final bell (§6): freeze the interview, then lock → debate → conclusion.
+    Blocking and slow (reasoning model, once) — the UI shows a 'scoring…' state."""
+    global _report
+    if _pipeline is None:
+        raise HTTPException(409, "no active session")
+    _pipeline.freeze()
+    transcript, claims, coverage, panel = _pipeline.report_inputs()
+    if not any(t.speaker == "candidate" for t in transcript):
+        raise HTTPException(400, "no candidate answers to score yet")
+    logger.info("concluding interview %s", _pipeline.interview_id)
+    _report = scoring.build_report(_pipeline.interview_id, panel, transcript, claims, coverage)
+    return _report
+
+
+@app.get("/report", response_model=InterviewReport)
+def get_report():
+    if _report is None:
+        raise HTTPException(404, "no report yet")
+    return _report
 
 
 @app.post("/session/stop")

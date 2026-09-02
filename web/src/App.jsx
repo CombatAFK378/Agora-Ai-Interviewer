@@ -22,6 +22,8 @@ export default function App() {
   const [claims, setClaims] = useState([]); // [{text,competency,strength,status,turn,contradicts}]
   const [contradictions, setContradictions] = useState(0);
   const [showDebug, setShowDebug] = useState(false);
+  const [report, setReport] = useState(null);
+  const [scoring, setScoring] = useState(false);
   const [logLines, setLogLines] = useState([]);
   const logRef = useRef(null);
 
@@ -152,6 +154,23 @@ export default function App() {
     log("left channel");
   }
 
+  const nameOf = (id) => agents.find((a) => a.id === id)?.name || id;
+  const titleOf = (id) => agents.find((a) => a.id === id)?.title || id;
+
+  async function finish() {
+    setScoring(true);
+    log("📋 scoring the interview — locking, debating, concluding…");
+    try {
+      const r = await fetch("/session/conclude", { method: "POST" });
+      if (!r.ok) throw new Error(`${r.status} ${await r.text()}`);
+      setReport(await r.json());
+      log("📋 report ready");
+    } catch (e) {
+      log("scoring error: " + (e.message || e));
+    }
+    setScoring(false);
+  }
+
   async function interrupt() {
     try {
       const r = await fetch("/session/interrupt", { method: "POST" });
@@ -177,11 +196,83 @@ export default function App() {
         <button className="interrupt" onClick={interrupt} disabled={!joined}>
           ✋ Interrupt
         </button>
+        <button className="finish" onClick={finish} disabled={!joined || scoring}>
+          {scoring ? "Scoring…" : "Finish & score"}
+        </button>
         <button onClick={leave} disabled={!joined}>
           Leave
         </button>
         <span className="status">{status}</span>
       </div>
+
+      {report && (
+        <div className="report">
+          <div className={"rec rec-" + report.conclusion.recommendation}>
+            {report.conclusion.recommendation.replace(/_/g, " ")}
+          </div>
+          <div className="headline">{report.conclusion.headline}</div>
+
+          <div className="score-grid">
+            {report.scores.map((s) => (
+              <div className="scorecard" key={s.agent_id}>
+                <div className="sc-head">
+                  <span className="sc-name">{nameOf(s.agent_id)}</span>
+                  <span className={"chip " + (s.conviction === "STRONG" ? "strong" : "neutral")}>
+                    {s.conviction}
+                  </span>
+                </div>
+                <div className="sc-role">{titleOf(s.agent_id)}</div>
+                <div className="sc-overall">
+                  {Math.round(s.overall * 100)}<span>/100</span>
+                </div>
+                {Object.entries(s.competency_scores).map(([k, v]) => (
+                  <div className="sc-comp" key={k}>
+                    <span className="sc-comp-name">{k}</span>
+                    <span className="sc-bar">
+                      <span className="sc-fill" style={{ width: `${Math.round(v * 100)}%` }} />
+                    </span>
+                  </div>
+                ))}
+                {s.rationale && <div className="sc-rat">{s.rationale}</div>}
+              </div>
+            ))}
+          </div>
+
+          <div className="rep-section">
+            <div className="rep-title">Debate</div>
+            {report.debate.map((d, i) => (
+              <div className="deb" key={i}>
+                <span className={"deb-act " + (d.rejected ? "rej" : d.action.toLowerCase())}>
+                  {d.rejected ? "MOVE→held" : d.action}
+                </span>
+                <b>{nameOf(d.agent_id)}</b>
+                {d.action === "MOVE" && !d.rejected && (
+                  <span className="deb-move">
+                    {" "}{Math.round(d.score_before * 100)}→{Math.round(d.score_after * 100)}
+                  </span>
+                )}
+                <span className="deb-text"> {d.statement}</span>
+              </div>
+            ))}
+          </div>
+
+          <div className="rep-section">
+            <div className="rep-title">Conclusion</div>
+            <p className="rep-reason">{report.conclusion.reasoning}</p>
+            {report.conclusion.unresolved.length > 0 && (
+              <div className="rep-title2">Unresolved — a human should verify</div>
+            )}
+            {report.conclusion.unresolved.map((u, i) => (
+              <div className="unres" key={i}>
+                <span className="unres-item">{u.item}</span>
+                <span className="unres-ev">{u.evidence}</span>
+              </div>
+            ))}
+          </div>
+
+          <div className="rep-hash">🔒 locked record · SHA-256 {report.locked_hash.slice(0, 24)}…</div>
+        </div>
+      )}
 
       <div className="howto">
         🎤 <b>Your mic</b> is for <b>answering</b> — speak, then pause. It won't cut the interviewer

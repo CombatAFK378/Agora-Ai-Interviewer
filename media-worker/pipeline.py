@@ -102,6 +102,7 @@ class InterviewPipeline:
         self._opened = False
         self._current_reply: TranscriptTurn | None = None   # turn currently being spoken
         self._last_speaker: str | None = None   # last panel agent to hold the floor
+        self._concluded = False   # set at the final bell; stops new turns
 
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True, name="pipeline")
@@ -120,6 +121,16 @@ class InterviewPipeline:
     def stop(self):
         self._stop.set()
         self._thread.join(timeout=2)
+
+    def freeze(self):
+        """Final bell: stop taking new turns so the record can be scored."""
+        self._concluded = True
+
+    def report_inputs(self):
+        """Snapshot the full record for scoring: (transcript, claims, coverage, panel)."""
+        with self._tx_lock:
+            transcript = [t.model_copy() for t in self.transcript]
+        return transcript, self.ledger.claims(), self.ledger.coverage(), list(self.panel)
 
     def request_interrupt(self) -> bool:
         """Manual barge-in from the candidate's Interrupt button."""
@@ -205,7 +216,7 @@ class InterviewPipeline:
 
     def _launch(self, target: Callable[[], None]):
         with self._reply_lock:
-            if self._replying:
+            if self._replying or self._concluded:
                 return
             self._replying = True
         threading.Thread(target=self._worker, args=(target,), daemon=True, name="reply").start()

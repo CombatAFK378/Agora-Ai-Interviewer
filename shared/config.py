@@ -28,7 +28,7 @@ class Settings(BaseSettings):
     # single groq_api_key if unset.
     groq_api_keys: str = ""
     llm_fast_model: str = "groq:openai/gpt-oss-120b"      # candidate is waiting
-    llm_reasoning_model: str = "openrouter:nvidia/nemotron-3-ultra-550b-a55b:free"
+    llm_reasoning_model: str = "openrouter:minimax/minimax-m3:free"
     llm_fallback_chain: str = ""                          # comma-separated ids
 
     # Smart Turn v3.1 end-of-turn detection
@@ -46,6 +46,11 @@ class Settings(BaseSettings):
     interview_time_budget_s: int = 1200
     coverage_lambda_start: float = 0.5
     coverage_lambda_end: float = 1.5
+
+    # Conviction (ARCHITECTURE §6): STRONG if |score-0.5| > margin AND
+    # evidence_count >= min_evidence, else NEUTRAL. Computed in code, not asked.
+    conviction_margin: float = 0.25
+    conviction_min_evidence: int = 3
 
     # Phase 1 tunables
     vad_stop_secs: float = 0.2

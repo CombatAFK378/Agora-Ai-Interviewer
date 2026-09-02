@@ -74,6 +74,7 @@ def chat(
     timeout: float = 30.0,
     retries: int = 2,
     reasoning_effort: str | None = None,
+    use_fallback_chain: bool = True,
 ) -> str:
     """Return the assistant message text for `messages`.
 
@@ -88,7 +89,9 @@ def chat(
     """
     settings = get_settings()
     primary = model or settings.llm_fast_model
-    chain = [primary] + [m for m in settings.fallback_models if m != primary]
+    chain = [primary]
+    if use_fallback_chain:
+        chain += [m for m in settings.fallback_models if m != primary]
 
     last_err: Exception | None = None
     for model_id in chain:
@@ -178,6 +181,20 @@ def _call(
     resp.raise_for_status()
 
     data = resp.json()
+    # Some providers return HTTP 200 with an error object in the body (e.g. an
+    # upstream capacity error). Treat capacity/5xx as transient so we retry.
+    if isinstance(data, dict) and data.get("error"):
+        err = data["error"] if isinstance(data["error"], dict) else {"message": data["error"]}
+        msg = str(err.get("message", err))
+        code = err.get("code")
+        transient = code in (408, 425, 429, 500, 502, 503, 504) or any(
+            k in msg.lower()
+            for k in ("overload", "exhaust", "temporarily", "rate limit", "timeout", "capacity")
+        )
+        if transient:
+            raise _Transient(f"upstream: {msg[:120]}")
+        raise ValueError(f"LLM error: {msg[:160]}")
+
     try:
         content = data["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError) as e:
