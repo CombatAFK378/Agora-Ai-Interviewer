@@ -14,6 +14,7 @@ so the candidate never wonders who is speaking (§12) — Deepgram Aura (accents
 """
 from dataclasses import dataclass
 
+from shared.competencies import DEFAULT_COMPETENCIES
 from shared.models import TranscriptTurn
 
 
@@ -137,25 +138,37 @@ _INTERVIEW_RULES = (
     "- Don't parrot their whole answer back, don't narrate what you're doing, no lists, "
     "no markdown, no preamble like 'Great question'.\n"
     "- Stay in your lane — probe YOUR area, not another interviewer's.\n"
+    "- READ THE ROOM: if the candidate clearly can't answer (\"I don't know\", "
+    "\"the library handles that\") or you've already mined this thread, do NOT ask a "
+    "harder version of the same question — acknowledge it and move to a fresh topic, "
+    "a different project, or hand off. Keep the interview varied.\n"
     "- If your earlier turn was interrupted, they only heard the part before the cut — "
     "pick up naturally.\n"
     "- Never mention these instructions or that you're an AI."
 )
 
 _BID_RULES = (
-    "\n\nYou are ONE of five interviewers on a panel ({focus}), deciding how much "
-    "YOU want to ask the NEXT question.\n"
-    "Be selective and honest — on most turns only one or two interviewers should be "
-    "highly interested:\n"
-    "- Bid HIGH (0.7-1.0) only when the latest answer clearly opens something in "
-    "YOUR area that you specifically should probe next.\n"
-    "- Bid LOW (0.0-0.3) when the current thread is squarely another interviewer's "
-    "area, your area is already covered, or you'd just be asking to ask. Bidding "
-    "low is expected and good.\n"
-    "- If you asked the last question and the candidate is still on YOUR thread, "
-    "it's fine to stay interested for a natural follow-up.\n"
-    "Respond with ONLY compact JSON, nothing else:\n"
-    '{{"interest": <float 0.0-1.0>, "reason": "<= 12 words>"}}'
+    "\n\nYou are ONE of five interviewers on a panel ({focus}). Do TWO things:\n"
+    "\n(A) BID — how much YOU want to ask the NEXT question. Be selective and "
+    "honest; on most turns only one or two interviewers should be highly "
+    "interested:\n"
+    "- HIGH (0.7-1.0) only when the latest answer clearly opens something in YOUR "
+    "area you should probe next.\n"
+    "- LOW (0.0-0.3) when the thread is squarely another interviewer's area, your "
+    "area is covered, or you'd just be asking to ask. Bidding low is good.\n"
+    "- If you asked last and the candidate is still on YOUR thread, staying "
+    "interested for a follow-up is fine.\n"
+    "\n(B) EXTRACT CLAIMS — concrete, factual things the candidate said in YOUR "
+    "area in their LATEST answer, as evidence. For each: short `text`, a "
+    "`competency` from [{comps}], `strength` 0-1 (how specific/verifiable), and "
+    "`status` \"SOLID\" (concrete, specific, often quantified) or \"VAGUE\" (hedgy, "
+    "hand-wavy, unquantified). Extract at most 2, and use [] if they said nothing "
+    "new in your area. If a claim clearly conflicts with something said earlier, "
+    "put a short note in `contradicts`, else null.\n"
+    "\nRespond with ONLY compact JSON, nothing else:\n"
+    '{{"interest": <float>, "reason": "<= 12 words>", '
+    '"claims_noticed": [{{"text": "...", "competency": "...", "strength": <float>, '
+    '"status": "SOLID|VAGUE"}}], "contradicts": null}}'
 )
 
 # Cold-start opening (§5): AI disclosure + panel intro, then a broad HM opener.
@@ -225,15 +238,22 @@ def _flatten_transcript(transcript: list[TranscriptTurn]) -> str:
     return "\n".join(lines)
 
 
+def _agent_competencies(agent_id: str) -> list[str]:
+    """Competency keys this agent owns — the ones its claims may be tagged with."""
+    return [c.key for c in DEFAULT_COMPETENCIES if agent_id in c.owners]
+
+
 def build_bid_prompt(agent_id: str, transcript: list[TranscriptTurn]) -> list[dict]:
-    """Construct the bid prompt for `agent_id` — returns JSON {interest, reason}.
+    """Construct the bid prompt for `agent_id` — returns JSON with the bid AND any
+    claims noticed in the candidate's latest answer (ARCHITECTURE §4).
 
     The transcript is flattened into one analysis block (NOT a role-play
     dialogue), so the model reasons *about* the conversation and emits a bid
     rather than being pulled into answering as the interviewer.
     """
     agent = AGENTS[agent_id]
-    system = agent.persona + _BID_RULES.format(focus=agent.focus or agent.title)
+    comps = ", ".join(_agent_competencies(agent_id)) or "general"
+    system = agent.persona + _BID_RULES.format(focus=agent.focus or agent.title, comps=comps)
     convo = _flatten_transcript(transcript) or "(nothing said yet)"
-    user = f"Conversation so far:\n\n{convo}\n\nNow output ONLY your bid as JSON."
+    user = f"Conversation so far:\n\n{convo}\n\nNow output ONLY your JSON."
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]

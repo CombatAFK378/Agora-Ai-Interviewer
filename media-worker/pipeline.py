@@ -38,6 +38,7 @@ import tts
 from shared import llm_router, orchestrator, prompts
 from shared.competencies import DEFAULT_COMPETENCIES
 from shared.config import Settings
+from shared.ledger import Ledger
 from shared.models import AuditEvent, TranscriptTurn
 
 logger = logging.getLogger(__name__)
@@ -71,6 +72,9 @@ class InterviewPipeline:
             lambda_start=settings.coverage_lambda_start,
             lambda_end=settings.coverage_lambda_end,
         )
+        # The evidence ledger: claims extracted inside bids, competency coverage.
+        self.ledger = Ledger(interview_id, DEFAULT_COMPETENCIES)
+        self._competencies = DEFAULT_COMPETENCIES
 
         self.vad = SileroVAD(
             sample_rate=self.sample_rate,
@@ -249,6 +253,14 @@ class InterviewPipeline:
 
         self._emit({"type": "thinking"})
         bids = orchestrator.collect_bids(self.panel, snapshot)
+
+        # Steps 5 and 10 are the same call (§4): the bids also carry the claims
+        # each interviewer noticed. Write them to the ledger, then refresh the
+        # coverage map that feeds `gap` in floor control (§5).
+        self._ingest_claims(bids, snapshot)
+        self.floor.set_coverage(self.ledger.coverage())
+        self._emit_ledger()
+
         decision = self.floor.decide(bids)
 
         summary = "  ".join(
@@ -263,9 +275,16 @@ class InterviewPipeline:
             "all_low": decision.all_low,
             "priorities": {a: round(p, 4) for a, p in decision.priorities.items()},
             "bids": {a: {"interest": bids[a].interest, "reason": bids[a].reason} for a in self.panel},
+            "coverage": {k: round(v, 3) for k, v in self.ledger.coverage().items()},
         })
 
-        text = self._generate_question(decision.winner)
+        pivot = (
+            "The panel has little left to ask on the current thread. Change "
+            "direction: open a NEW topic in your area — a different project or "
+            "experience the candidate hasn't covered yet, or a short scenario — "
+            "rather than drilling the same thing. Acknowledge briefly, then pivot."
+        ) if decision.all_low else ""
+        text = self._generate_question(decision.winner, extra=pivot)
         if not text:
             return
         self._speak_and_wait(decision.winner, text)
@@ -374,6 +393,35 @@ class InterviewPipeline:
                 cb(event)
             except Exception:
                 logger.exception("on_event handler failed")
+
+    def _ingest_claims(self, bids: dict, snapshot: list[TranscriptTurn]):
+        """Write the claims each interviewer noticed into the evidence ledger."""
+        source_turn = next((t.seq for t in reversed(snapshot) if t.speaker == "candidate"), 0)
+        added = 0
+        for aid in self.panel:
+            for c in bids[aid].claims:
+                self.ledger.add(
+                    text=c["text"], competency=c["competency"], source_turn=source_turn,
+                    strength=c["strength"], status=c["status"], noticed_by=aid,
+                    contradicts_text=bids[aid].contradicts,
+                )
+                added += 1
+        if added:
+            logger.info("ledger: +%d claim(s) from turn %d (%d total)",
+                        added, source_turn, len(self.ledger.claims()))
+
+    def _emit_ledger(self):
+        cov = self.ledger.coverage()
+        self._emit({
+            "type": "ledger",
+            "coverage": [{"key": c.key, "name": c.name, "value": round(cov.get(c.key, 0.0), 3)}
+                         for c in self._competencies],
+            "claims": [{"text": cl.text, "competency": cl.competency,
+                        "strength": round(cl.strength, 2), "status": cl.status,
+                        "turn": cl.source_turn, "contradicts": cl.contradicts_claim_id}
+                       for cl in self.ledger.claims()[-25:]],
+            "contradictions": len(self.ledger.contradictions()),
+        })
 
 
 # ---- helpers ---------------------------------------------------------------

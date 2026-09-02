@@ -18,6 +18,10 @@ export default function App() {
   const [thinking, setThinking] = useState(false);
   const [agentCap, setAgentCap] = useState(null); // {name,title,text}
   const [candCap, setCandCap] = useState(null); // text
+  const [coverage, setCoverage] = useState([]); // [{key,name,value}]
+  const [claims, setClaims] = useState([]); // [{text,competency,strength,status,turn,contradicts}]
+  const [contradictions, setContradictions] = useState(0);
+  const [showDebug, setShowDebug] = useState(false);
   const [logLines, setLogLines] = useState([]);
   const logRef = useRef(null);
 
@@ -62,6 +66,10 @@ export default function App() {
         setSpeaking(null);
       } else if (ev.type === "heard") {
         setCandCap(ev.text);
+      } else if (ev.type === "ledger") {
+        setCoverage(ev.coverage || []);
+        setClaims(ev.claims || []);
+        setContradictions(ev.contradictions || 0);
       }
     };
     sock.onclose = () => log("events socket closed");
@@ -214,6 +222,53 @@ export default function App() {
           </div>
         )}
       </div>
+
+      <div className="debugbar">
+        <button className="ghost" onClick={() => setShowDebug((s) => !s)}>
+          {showDebug ? "▾ Hide panel internals" : "▸ Panel internals (coverage & evidence)"}
+        </button>
+        {contradictions > 0 && (
+          <span className="flag">⚠ {contradictions} contradiction{contradictions > 1 ? "s" : ""}</span>
+        )}
+      </div>
+
+      {showDebug && (
+        <div className="debug">
+          <div className="cov">
+            <div className="cov-title">Competency coverage</div>
+            {coverage.length === 0 && <div className="empty">— no evidence yet —</div>}
+            {coverage.map((c) => (
+              <div className="cov-row" key={c.key}>
+                <span className="cov-name">{c.name}</span>
+                <span className="cov-bar">
+                  <span className="cov-fill" style={{ width: `${Math.round(c.value * 100)}%` }} />
+                </span>
+                <span className="cov-val">{Math.round(c.value * 100)}%</span>
+              </div>
+            ))}
+          </div>
+          <div className="claimlist">
+            <div className="cov-title">Evidence ledger ({claims.length})</div>
+            {claims.length === 0 && <div className="empty">— no claims extracted yet —</div>}
+            {claims
+              .slice()
+              .reverse()
+              .map((cl, i) => (
+                <div
+                  className={"claim " + (cl.status === "VAGUE" ? "vague" : "solid") + (cl.contradicts ? " contra" : "")}
+                  key={i}
+                >
+                  <span className="claim-status">{cl.status}</span>
+                  <span className="claim-text">{cl.text}</span>
+                  <span className="claim-meta">
+                    {cl.competency} · {Math.round(cl.strength * 100)}% · turn {cl.turn}
+                    {cl.contradicts ? " · ⚠ contradiction" : ""}
+                  </span>
+                </div>
+              ))}
+          </div>
+        </div>
+      )}
 
       <div className="log" ref={logRef}>
         {logLines.join("\n")}

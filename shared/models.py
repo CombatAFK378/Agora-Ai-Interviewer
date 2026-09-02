@@ -41,3 +41,30 @@ class AuditEvent(BaseModel):
     type: str
     data: dict = Field(default_factory=dict)
     ts: float = Field(default_factory=time.time)
+
+
+# Claim status (ARCHITECTURE §3). Resume-derived claims start UNVERIFIED (Phase 7);
+# interview claims are SOLID (concrete, specific) or VAGUE (hedgy, hand-wavy).
+CLAIM_SOLID = "SOLID"
+CLAIM_VAGUE = "VAGUE"
+CLAIM_UNVERIFIED = "UNVERIFIED"
+
+
+class Claim(BaseModel):
+    """One entry in the evidence ledger — a factual claim the candidate made,
+    extracted inside a bid call and tied to a competency (ARCHITECTURE §3, §4).
+
+    `strength` (0–1) and `status` drive competency coverage; `contradicts_claim_id`
+    links a claim that conflicts with an earlier one (resume-vs-interview
+    contradiction comes free in Phase 7 once resume claims seed the ledger).
+    """
+    id: str
+    interview_id: str
+    text: str
+    competency: str                       # competency key
+    source_turn: int                      # transcript_turn seq it came from
+    strength: float                       # 0–1
+    status: str = CLAIM_SOLID             # SOLID | VAGUE | UNVERIFIED
+    noticed_by: list[str] = Field(default_factory=list)  # agent ids
+    contradicts_claim_id: str | None = None
+    ts: float = Field(default_factory=time.time)

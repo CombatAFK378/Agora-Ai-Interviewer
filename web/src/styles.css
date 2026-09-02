@@ -42,5 +42,30 @@ button:disabled { opacity:.45; cursor:not-allowed; }
 .cap.agent { border-left:3px solid var(--live); }
 .cap.cand { border-left:3px solid var(--accent); }
 
+.debugbar { margin-top:18px; display:flex; align-items:center; gap:12px; }
+button.ghost { background:transparent; border:1px dashed var(--line); color:var(--dim); font-weight:600; padding:6px 12px; font-size:.82rem; }
+.flag { color:var(--warn); font-size:.82rem; font-weight:700; }
+
+.debug { margin-top:10px; display:grid; grid-template-columns: 1fr 1fr; gap:14px; }
+@media (max-width:720px){ .debug { grid-template-columns:1fr; } }
+.cov, .claimlist { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:12px 14px; }
+.cov-title { font-size:.72rem; text-transform:uppercase; letter-spacing:.5px; color:var(--dim); margin-bottom:10px; }
+.empty { color:var(--dim); font-size:.82rem; font-style:italic; }
+.cov-row { display:flex; align-items:center; gap:8px; margin:7px 0; font-size:.8rem; }
+.cov-name { flex:0 0 42%; color:var(--text); }
+.cov-bar { flex:1; height:8px; background:#0b1225; border-radius:6px; overflow:hidden; }
+.cov-fill { display:block; height:100%; background:linear-gradient(90deg,#4f8cff,#22c55e); transition:width .4s; }
+.cov-val { flex:0 0 34px; text-align:right; color:var(--dim); }
+
+.claimlist { max-height:260px; overflow-y:auto; }
+.claim { padding:7px 0; border-bottom:1px solid var(--line); font-size:.82rem; }
+.claim:last-child { border-bottom:none; }
+.claim-status { font-size:.6rem; font-weight:800; padding:1px 6px; border-radius:999px; margin-right:6px; }
+.claim.solid .claim-status { background:#123a24; color:#4ade80; }
+.claim.vague .claim-status { background:#3a2f12; color:#fbbf24; }
+.claim.contra { background:rgba(245,158,11,.06); }
+.claim-text { color:var(--text); }
+.claim-meta { display:block; color:var(--dim); font-size:.72rem; margin-top:2px; }
+
 .log { margin-top:16px; background:#070b18; color:#9ae6b4; padding:10px 12px; border-radius:10px; border:1px solid var(--line);
        height:150px; overflow-y:auto; font-family: ui-monospace, monospace; font-size:.75rem; white-space:pre-wrap; }

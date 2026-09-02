@@ -48,6 +48,12 @@ class Bid:
     agent_id: str
     interest: float
     reason: str
+    claims: list[dict] = None          # [{text, competency, strength, status}]
+    contradicts: str | None = None
+
+    def __post_init__(self):
+        if self.claims is None:
+            self.claims = []
 
 
 @dataclass
@@ -90,6 +96,10 @@ class FloorController:
         frac = min(1.0, (time.monotonic() - self._start) / self.time_budget)
         return self.l0 + (self.l1 - self.l0) * frac
 
+    def set_coverage(self, coverage: dict[str, float]) -> None:
+        """Update the coverage map from the evidence ledger (Phase 4)."""
+        self._coverage = dict(coverage)
+
     def coverage(self, competency_key: str) -> float:
         return self._coverage.get(competency_key, 0.0)
 
@@ -131,7 +141,26 @@ class FloorController:
         winner = contenders[0]
         all_low = all((bids[a].interest if a in bids else 0.0) < LOW_INTEREST
                       for a in self.panel_ids)
+        # Panel has little left to ask on this thread (§5): don't grind — hand the
+        # floor to the owner of the least-covered competency to open a new topic.
+        if all_low:
+            winner = self._weakest_owner()
         return FloorDecision(winner, pr, lam, bids, all_low)
+
+    def _weakest_owner(self) -> str:
+        """The panel interviewer who owns the least-covered competency, preferring
+        someone other than the last speaker so the topic actually changes."""
+        last = max(self._last_spoke, key=self._last_spoke.get) if self._last_spoke else None
+        order = sorted(self.comps, key=lambda c: self.coverage(c.key))
+        for c in order:                      # first pass: avoid the last speaker
+            for o in c.owners:
+                if o in self.panel_ids and o != last:
+                    return o
+        for c in order:                      # fallback: any owner
+            for o in c.owners:
+                if o in self.panel_ids:
+                    return o
+        return self.panel_ids[0]
 
     def record(self, agent_id: str) -> None:
         self._turn += 1
@@ -158,14 +187,14 @@ def _one_bid(agent_id: str, transcript: list[TranscriptTurn]) -> Bid:
     messages = prompts.build_bid_prompt(agent_id, transcript)
     for attempt in range(2):   # malformed JSON → retry once, then default (§10)
         try:
-            # gpt-oss spends completion tokens on reasoning before the JSON, so
-            # give it enough headroom that the (tiny) JSON isn't truncated — but
-            # keep it modest to stay under the tokens-per-minute cap.
+            # gpt-oss spends completion tokens on reasoning before the JSON; the
+            # JSON now also carries claims, so give a bit more headroom — still
+            # modest to stay under the tokens-per-minute cap.
             raw = llm_router.chat(
-                messages, max_tokens=160, temperature=0.3, reasoning_effort="low"
+                messages, max_tokens=280, temperature=0.3, reasoning_effort="low"
             )
-            interest, reason = _parse_bid(raw)
-            return Bid(agent_id, interest, reason)
+            interest, reason, claims, contradicts = _parse_bid(raw)
+            return Bid(agent_id, interest, reason, claims, contradicts)
         except Exception as e:
             logger.warning("bid %s attempt %d failed: %s", agent_id, attempt + 1, e)
     logger.warning("bid %s defaulting to interest=0.3", agent_id)
@@ -175,12 +204,27 @@ def _one_bid(agent_id: str, transcript: list[TranscriptTurn]) -> Bid:
 _JSON_OBJ = re.compile(r"\{.*\}", re.DOTALL)
 
 
-def _parse_bid(raw: str) -> tuple[float, str]:
+def _parse_bid(raw: str) -> tuple[float, str, list[dict], str | None]:
     m = _JSON_OBJ.search(raw)
     if not m:
         raise ValueError(f"no JSON object in bid: {raw!r}")
     data = json.loads(m.group(0))
-    interest = float(data["interest"])
-    interest = max(0.0, min(1.0, interest))
+    interest = max(0.0, min(1.0, float(data["interest"])))
     reason = str(data.get("reason", "")).strip()[:120]
-    return interest, reason
+
+    claims = []
+    for c in (data.get("claims_noticed") or [])[:3]:
+        text = str(c.get("text", "")).strip()
+        if not text:
+            continue
+        status = str(c.get("status", "SOLID")).upper()
+        claims.append({
+            "text": text[:200],
+            "competency": str(c.get("competency", "")).strip(),
+            "strength": max(0.0, min(1.0, float(c.get("strength", 0.5)))),
+            "status": status if status in ("SOLID", "VAGUE") else "SOLID",
+        })
+
+    contradicts = data.get("contradicts")
+    contradicts = str(contradicts).strip()[:200] if contradicts else None
+    return interest, reason, claims, contradicts

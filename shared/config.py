@@ -22,6 +22,11 @@ class Settings(BaseSettings):
     # to OpenRouter. Both providers are OpenAI-compatible.
     openrouter_api_key: str = ""
     groq_api_key: str = ""
+    # Optional pool of Groq keys (comma-separated) from separate accounts. The
+    # router round-robins across them so the per-account tokens-per-minute limit
+    # is shared out — same model/quality, ~N× the free budget. Falls back to the
+    # single groq_api_key if unset.
+    groq_api_keys: str = ""
     llm_fast_model: str = "groq:openai/gpt-oss-120b"      # candidate is waiting
     llm_reasoning_model: str = "openrouter:nvidia/nemotron-3-ultra-550b-a55b:free"
     llm_fallback_chain: str = ""                          # comma-separated ids
@@ -57,6 +62,14 @@ class Settings(BaseSettings):
     def fallback_models(self) -> list[str]:
         """Parsed fallback chain: primary tried first, then these in order."""
         return [m.strip() for m in self.llm_fallback_chain.split(",") if m.strip()]
+
+    @property
+    def groq_keys(self) -> list[str]:
+        """All Groq keys to round-robin over (pool, else the single key)."""
+        pool = [k.strip() for k in self.groq_api_keys.split(",") if k.strip()]
+        if pool:
+            return pool
+        return [self.groq_api_key] if self.groq_api_key else []
 
 
 @lru_cache

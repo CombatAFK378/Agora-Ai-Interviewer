@@ -25,6 +25,7 @@ scaling concern for many concurrent interviews and lands with the storage layer;
 Phase 2 runs one interview, so per-call retry/backoff is enough here.
 """
 import logging
+import threading
 import time
 
 import requests
@@ -32,6 +33,21 @@ import requests
 from shared.config import get_settings
 
 logger = logging.getLogger(__name__)
+
+# Round-robin index across a pool of same-provider keys (e.g. several Groq keys
+# from separate accounts, each with its own tokens-per-minute budget).
+_key_lock = threading.Lock()
+_key_idx = 0
+
+
+def _next_key(keys: list[str]) -> str:
+    global _key_idx
+    if len(keys) == 1:
+        return keys[0]
+    with _key_lock:
+        key = keys[_key_idx % len(keys)]
+        _key_idx += 1
+    return key
 
 # provider name -> (chat-completions URL, Settings attribute holding the key)
 PROVIDERS = {
@@ -78,13 +94,19 @@ def chat(
     for model_id in chain:
         provider, bare_model = _split(model_id)
         url, key_attr = PROVIDERS[provider]
-        api_key = getattr(settings, key_attr, "")
-        if not api_key:
+        # Groq draws from a key pool (round-robin); other providers use one key.
+        if provider == "groq":
+            keys = settings.groq_keys
+        else:
+            k = getattr(settings, key_attr, "")
+            keys = [k] if k else []
+        if not keys:
             last_err = LLMError(f"no key for provider {provider!r} ({model_id})")
-            logger.warning("skipping %s: %s not set", model_id, key_attr.upper())
+            logger.warning("skipping %s: no key configured", model_id)
             continue
 
         for attempt in range(retries + 1):
+            api_key = _next_key(keys)   # rotate each attempt so a 429 retries on a fresh key
             try:
                 return _call(
                     url, api_key, bare_model, messages,
