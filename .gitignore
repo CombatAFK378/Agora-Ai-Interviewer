@@ -38,3 +38,6 @@ agorareport.dat
 
 # Claude Code local settings
 .claude/
+
+# Phase 8: persisted interviews (may contain candidate PII)
+data/

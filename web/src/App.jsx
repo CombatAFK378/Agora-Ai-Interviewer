@@ -10,6 +10,59 @@ const AVATAR_COLORS = ["#4f8cff", "#a855f7", "#ef4444", "#14b8a6", "#f59e0b", "#
 
 const initials = (name) => (name || "?").slice(0, 1).toUpperCase();
 
+const prettyKey = (k) =>
+  (k || "").replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+
+// Confidence trajectory (§11): mean coverage over turns, bold, with faint
+// per-competency lines. Pure inline SVG — no chart library.
+function ConfidenceChart({ trajectory }) {
+  if (!trajectory || trajectory.length < 2) return null;
+  const W = 640, H = 200, pad = 28;
+  const n = trajectory.length;
+  const x = (i) => pad + (i * (W - 2 * pad)) / (n - 1);
+  const y = (v) => H - pad - Math.max(0, Math.min(1, v)) * (H - 2 * pad);
+  const keys = Object.keys(trajectory[trajectory.length - 1].coverage || {});
+  const line = (getter) => trajectory.map((p, i) => `${x(i)},${y(getter(p))}`).join(" ");
+  const meanPts = line((p) => p.mean);
+  const areaPts = `${pad},${H - pad} ${meanPts} ${x(n - 1)},${H - pad}`;
+  return (
+    <div className="chart">
+      <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" className="chart-svg">
+        {[0, 0.25, 0.5, 0.75, 1].map((g) => (
+          <g key={g}>
+            <line x1={pad} y1={y(g)} x2={W - pad} y2={y(g)} className="grid" />
+            <text x={4} y={y(g) + 3} className="axis">{Math.round(g * 100)}</text>
+          </g>
+        ))}
+        {keys.map((k, ci) => (
+          <polyline
+            key={k}
+            points={line((p) => (p.coverage || {})[k] ?? 0)}
+            fill="none"
+            stroke={AVATAR_COLORS[ci % AVATAR_COLORS.length]}
+            strokeWidth="1"
+            opacity="0.45"
+          />
+        ))}
+        <polygon points={areaPts} className="chart-area" />
+        <polyline points={meanPts} className="chart-mean" fill="none" />
+        {trajectory.map((p, i) => (
+          <circle key={i} cx={x(i)} cy={y(p.mean)} r="2.5" className="chart-dot" />
+        ))}
+      </svg>
+      <div className="chart-legend">
+        <span className="lg lg-mean">panel mean</span>
+        {keys.map((k, ci) => (
+          <span className="lg" key={k}>
+            <i style={{ background: AVATAR_COLORS[ci % AVATAR_COLORS.length] }} />
+            {prettyKey(k)}
+          </span>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const [agents, setAgents] = useState([]); // [{id,name,title}]
   const [joined, setJoined] = useState(false);
@@ -46,6 +99,16 @@ export default function App() {
   const [dossier, setDossier] = useState(null); // parsed preview
   const [parsing, setParsing] = useState(false);
   const [activePanel, setActivePanel] = useState([]); // dossier-selected interviewer ids
+  // Phase 8 — recruiter dashboard.
+  const [view, setView] = useState("room"); // "room" | "dashboard"
+  const [interviews, setInterviews] = useState([]); // past interview summaries
+  const [storedId, setStoredId] = useState(null); // opened stored interview id
+  // Phase 8 — coding round (screen share + vision).
+  const [codingTask, setCodingTask] = useState(null);
+  const [sharing, setSharing] = useState(false);
+  const [finished, setFinished] = useState([]); // interviewer ids done (e.g. coding)
+  const screenRef = useRef(null); // MediaStream
+  const frameTimer = useRef(null);
   const logRef = useRef(null);
 
   const client = useRef(null);
@@ -95,6 +158,20 @@ export default function App() {
         setContradictions(ev.contradictions || 0);
       } else if (ev.type === "override" && ev.override) {
         setOverrides((o) => [...o, ev.override]); // override fired by voice
+      } else if (ev.type === "coding_task") {
+        setCodingTask(ev.text);
+        log("🖥️ coding task set — share your screen so Liam can watch");
+      } else if (ev.type === "screen_read") {
+        log("👁️ Liam sees: " + ev.text);
+      } else if (ev.type === "coding_done") {
+        setFinished((f) => (f.includes("coding") ? f : [...f, "coding"]));
+        setCodingTask(null);
+        stopSharing();
+        log(
+          ev.verdict === "cheating"
+            ? "🚩 Liam flagged the coding round (outside help) — handing back to the panel"
+            : "✅ coding round complete — Liam is done, panel continues"
+        );
       }
     };
     sock.onclose = () => log("events socket closed");
@@ -205,6 +282,8 @@ export default function App() {
       if (!resp.ok) throw new Error(`${resp.status} ${await resp.text()}`);
       const s = await resp.json();
       setActivePanel(s.panel || []);
+      setFinished([]);
+      setCodingTask(null);
       log(`channel=${s.channel} uid=${s.uid} panel=${(s.panel || []).join(",")}`);
       setStatus("Joining channel…");
       await connectAgora(s);
@@ -221,7 +300,11 @@ export default function App() {
     setStatus("Joining the panel…");
     try {
       await disconnectAgora();          // leave the interview channel first
-      const resp = await fetch("/panel/join", { method: "POST" });
+      const resp = await fetch("/panel/join", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ interview_id: storedId || null }),
+      });
       if (!resp.ok) throw new Error(`${resp.status} ${await resp.text()}`);
       const s = await resp.json();
       await connectAgora(s);
@@ -236,7 +319,127 @@ export default function App() {
     }
   }
 
+  async function shareScreen() {
+    try {
+      const stream = await navigator.mediaDevices.getDisplayMedia({
+        video: { displaySurface: "monitor", frameRate: 1 }, // hint: whole screen
+        audio: false,
+      });
+      // Enforce entire-screen only: the browser won't let us remove the window/tab
+      // options, but we refuse anything that isn't the full monitor so a candidate
+      // can't hide an AI tool in an unshared window (§8).
+      const surface = stream.getVideoTracks()[0].getSettings().displaySurface;
+      if (surface && surface !== "monitor") {
+        stream.getTracks().forEach((t) => t.stop());
+        setStatus("Please share your ENTIRE screen (not a window or tab), then try again.");
+        log(`❌ shared a ${surface}, not the whole screen — rejected. Share entire screen.`);
+        return;
+      }
+      screenRef.current = stream;
+      setSharing(true);
+      const video = document.createElement("video");
+      video.srcObject = stream;
+      video.muted = true;
+      await video.play();
+      const canvas = document.createElement("canvas");
+      const capture = async () => {
+        const w = video.videoWidth, h = video.videoHeight;
+        if (!w || !h) return;
+        const scale = Math.min(1, 1280 / w); // cap width so frames stay small
+        canvas.width = Math.round(w * scale);
+        canvas.height = Math.round(h * scale);
+        canvas.getContext("2d").drawImage(video, 0, 0, canvas.width, canvas.height);
+        const frame = canvas.toDataURL("image/jpeg", 0.6);
+        try {
+          await fetch("/coding/frame", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ frame }),
+          });
+        } catch { /* transient — next tick retries */ }
+      };
+      await capture();
+      frameTimer.current = setInterval(capture, 5000); // a frame every 5s
+      stream.getVideoTracks()[0].onended = stopSharing; // user hit browser "Stop sharing"
+      log("🖥️ screen sharing started — Liam can see your editor");
+    } catch (e) {
+      log("screen share error: " + (e.message || e));
+    }
+  }
+
+  function stopSharing() {
+    if (frameTimer.current) {
+      clearInterval(frameTimer.current);
+      frameTimer.current = null;
+    }
+    if (screenRef.current) {
+      screenRef.current.getTracks().forEach((t) => t.stop());
+      screenRef.current = null;
+    }
+    setSharing(false);
+  }
+
+  async function loadInterviews() {
+    try {
+      const r = await fetch("/interviews");
+      if (!r.ok) throw new Error(`${r.status}`);
+      setInterviews(await r.json());
+    } catch (e) {
+      log("dashboard load error: " + (e.message || e));
+    }
+  }
+
+  async function openInterview(summary) {
+    try {
+      const r = await fetch(`/interviews/${summary.interview_id}/open`, { method: "POST" });
+      if (!r.ok) throw new Error(`${r.status} ${await r.text()}`);
+      const rep = await r.json();
+      setReport(rep);
+      setStoredId(summary.interview_id);
+      setQa([]);
+      setOverrides(
+        summary.override
+          ? [{ original_recommendation: rep.conclusion.recommendation,
+               decision: summary.override, reason: "(logged earlier)" }]
+          : []
+      );
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    } catch (e) {
+      log("open interview error: " + (e.message || e));
+    }
+  }
+
+  function backToList() {
+    setStoredId(null);
+    setReport(null);
+    setOverrides([]);
+    setQa([]);
+    loadInterviews();
+  }
+
+  function switchView(v) {
+    if (v === "room") {
+      // Returning to the live room from the dashboard: drop any stored report we
+      // were viewing (and leave a panel voice call if we joined one) so the room
+      // resets to the fresh setup screen. A live interview can't reach here — the
+      // dashboard tab is disabled while one is running.
+      if (talking) leave();
+      setStoredId(null);
+      setReport(null);
+      setOverrides([]);
+      setQa([]);
+      setView("room");
+      if (!talking) setStatus("Idle.");
+      return;
+    }
+    setView("dashboard");
+    setStoredId(null);
+    if (!joined) setReport(null);
+    loadInterviews();
+  }
+
   async function leave() {
+    stopSharing();
     try {
       await disconnectAgora();
       await fetch("/session/stop", { method: "POST" });
@@ -247,6 +450,8 @@ export default function App() {
     setTalking(false);
     setSpeaking(null);
     setThinking(false);
+    setCodingTask(null);
+    setFinished([]);
     setStatus("Idle.");
     log("left channel");
   }
@@ -328,13 +533,60 @@ export default function App() {
 
   return (
     <div className="wrap">
+      <div className="disclosure" role="note">
+        <span className="dot" aria-hidden="true" />
+        AI interview — every interviewer is AI. This session is recorded and transcribed.
+      </div>
       <h1>968ms — AI Interview Panel</h1>
       <p className="sub">
         Five AI interviewers. Whoever's speaking lights up. Answer with your mic; use Interrupt to
         cut in.
       </p>
 
-      {!joined && !report && (
+      <div className="nav">
+        <button className={view === "room" ? "nav-on" : ""} onClick={() => switchView("room")}>
+          🎥 Live interview
+        </button>
+        <button
+          className={view === "dashboard" ? "nav-on" : ""}
+          onClick={() => switchView("dashboard")}
+          disabled={joined && !talking}
+        >
+          📋 Past interviews
+        </button>
+      </div>
+
+      {view === "dashboard" && !report && (
+        <div className="dash">
+          <div className="rep-title">Past interviews ({interviews.length})</div>
+          {interviews.length === 0 && (
+            <div className="empty">— no interviews yet. Run one from the Live tab. —</div>
+          )}
+          {interviews.map((it) => (
+            <button className="dash-row" key={it.interview_id} onClick={() => openInterview(it)}>
+              <div className="dash-main">
+                <span className="dash-name">{it.candidate_name || "Unnamed candidate"}</span>
+                <span className="dash-role">{it.role || "—"}</span>
+              </div>
+              <div className="dash-meta">
+                <span className={"rec rec-" + it.recommendation}>
+                  {(it.recommendation || "").replace(/_/g, " ")}
+                </span>
+                {it.override && (
+                  <span className={"rec rec-" + it.override}>
+                    → {it.override.replace(/_/g, " ")}
+                  </span>
+                )}
+                <span className="dash-date">
+                  {it.created_at ? new Date(it.created_at * 1000).toLocaleString() : ""}
+                </span>
+              </div>
+            </button>
+          ))}
+        </div>
+      )}
+
+      {view === "room" && !joined && !report && (
         <div className="setup">
           <div className="setup-head">
             <strong>Interview dossier</strong>
@@ -460,24 +712,56 @@ export default function App() {
         </div>
       )}
 
-      <div className="controls">
-        <button className="join" onClick={join} disabled={joined}>
-          Join Interview
-        </button>
-        <button className="interrupt" onClick={interrupt} disabled={!joined}>
-          ✋ Interrupt
-        </button>
-        <button className="finish" onClick={finish} disabled={!joined || scoring}>
-          {scoring ? "Scoring…" : "Finish & score"}
-        </button>
-        <button onClick={leave} disabled={!joined}>
-          Leave
-        </button>
-        <span className="status">{status}</span>
-      </div>
+      {view === "room" && (
+        <div className="controls">
+          <button className="join" onClick={join} disabled={joined}>
+            Join Interview
+          </button>
+          <button className="interrupt" onClick={interrupt} disabled={!joined}>
+            ✋ Interrupt
+          </button>
+          <button className="finish" onClick={finish} disabled={!joined || scoring}>
+            {scoring ? "Scoring…" : "Finish & score"}
+          </button>
+          <button onClick={leave} disabled={!joined}>
+            Leave
+          </button>
+          <span className="status">{status}</span>
+        </div>
+      )}
+
+      {view === "room" && joined && !talking && codingTask && (
+        <div className="coding">
+          <div className="coding-head">
+            <strong>🖥️ Live coding task</strong>
+            {sharing ? (
+              <button className="ghost" onClick={stopSharing}>Stop sharing</button>
+            ) : (
+              <button className="join" onClick={shareScreen}>Share entire screen</button>
+            )}
+          </div>
+          <div className="coding-task">{codingTask}</div>
+          <div className="coding-note">
+            {sharing
+              ? "Sharing your whole screen — Liam can see your editor and will react to your code."
+              : "You must share your ENTIRE screen (a window or tab will be rejected) so Liam can watch you code. Think out loud as you go."}
+          </div>
+        </div>
+      )}
 
       {report && (
         <div className="report">
+          {(storedId || talking) && (
+            <div className="report-bar">
+              {storedId && (
+                <button className="ghost" onClick={backToList}>← Back to interviews</button>
+              )}
+              {talking && (
+                <button onClick={leave}>Leave voice</button>
+              )}
+              <span className="status">{status}</span>
+            </div>
+          )}
           <div className="rec-line">
             <span className={"rec rec-" + report.conclusion.recommendation}>
               {report.conclusion.recommendation.replace(/_/g, " ")}
@@ -515,6 +799,13 @@ export default function App() {
               </div>
             ))}
           </div>
+
+          {report.trajectory && report.trajectory.length >= 2 && (
+            <div className="rep-section">
+              <div className="rep-title">Confidence trajectory (evidence coverage per turn)</div>
+              <ConfidenceChart trajectory={report.trajectory} />
+            </div>
+          )}
 
           <div className="rep-section">
             <div className="rep-title">Debate</div>
@@ -626,25 +917,32 @@ export default function App() {
         </div>
       )}
 
-      <div className="howto">
-        🎤 <b>Your mic</b> is for <b>answering</b> — speak, then pause. It won't cut the interviewer
-        off. &nbsp;•&nbsp; ✋ <b>Interrupt</b> is the only way to cut in while someone's talking.
-        &nbsp;•&nbsp; 🧹 AI noise suppression cleans your mic automatically.
-      </div>
+      {view === "room" && (
+        <div className="howto">
+          🎤 <b>Your mic</b> is for <b>answering</b> — speak, then pause. It won't cut the interviewer
+          off. &nbsp;•&nbsp; ✋ <b>Interrupt</b> is the only way to cut in while someone's talking.
+          &nbsp;•&nbsp; 🧹 AI noise suppression cleans your mic automatically.
+        </div>
+      )}
 
+      {(view === "room" || talking) && (
+      <>
       <div className="tiles">
         {agents.map((a, i) => {
-          const offPanel = activePanel.length > 0 && !activePanel.includes(a.id);
+          const done = finished.includes(a.id);
+          const offPanel = !done && activePanel.length > 0 && !activePanel.includes(a.id);
+          const dim = offPanel || done;
           return (
             <div
               key={a.id}
               className={
                 "tile" +
-                (offPanel ? " off-panel" : "") +
-                (!offPanel && speaking === a.id ? " speaking" : !offPanel && thinking ? " thinking" : "")
+                (dim ? " off-panel" : "") +
+                (!dim && speaking === a.id ? " speaking" : !dim && thinking ? " thinking" : "")
               }
             >
               <span className="badge">SPEAKING</span>
+              {done && <span className="offbadge">✓ coding done</span>}
               {offPanel && <span className="offbadge">not on this panel</span>}
               <div className="avatar" style={{ background: AVATAR_COLORS[i % AVATAR_COLORS.length] }}>
                 {initials(a.name)}
@@ -673,17 +971,21 @@ export default function App() {
           </div>
         )}
       </div>
+      </>
+      )}
 
-      <div className="debugbar">
-        <button className="ghost" onClick={() => setShowDebug((s) => !s)}>
-          {showDebug ? "▾ Hide panel internals" : "▸ Panel internals (coverage & evidence)"}
-        </button>
-        {contradictions > 0 && (
-          <span className="flag">⚠ {contradictions} contradiction{contradictions > 1 ? "s" : ""}</span>
-        )}
-      </div>
+      {view === "room" && (
+        <div className="debugbar">
+          <button className="ghost" onClick={() => setShowDebug((s) => !s)}>
+            {showDebug ? "▾ Hide panel internals" : "▸ Panel internals (coverage & evidence)"}
+          </button>
+          {contradictions > 0 && (
+            <span className="flag">⚠ {contradictions} contradiction{contradictions > 1 ? "s" : ""}</span>
+          )}
+        </div>
+      )}
 
-      {showDebug && (
+      {view === "room" && showDebug && (
         <div className="debug">
           <div className="cov">
             <div className="cov-title">Competency coverage</div>

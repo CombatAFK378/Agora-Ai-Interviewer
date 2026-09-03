@@ -131,6 +131,42 @@ def chat(
     raise LLMError(f"all models failed; last error: {last_err}")
 
 
+def see(
+    prompt: str,
+    image_url: str,
+    *,
+    model: str | None = None,
+    max_tokens: int = 220,
+    temperature: float = 0.3,
+    timeout: float = 40.0,
+    retries: int = 1,
+) -> str:
+    """Vision call (§8 coding round): assess an image. `image_url` is a data: URI
+    (or URL). Tries a chain of VISION-capable models (text models can't see, so the
+    normal text fallback chain is bypassed) — free vision tiers 429 often, so we
+    fall through to the next one before giving up. Caller degrades gracefully."""
+    settings = get_settings()
+    primary = model or settings.llm_vision_model
+    chain, seen = [], set()
+    for m in [primary, *settings.vision_fallbacks]:   # dedupe, keep order
+        if m and m not in seen:
+            seen.add(m)
+            chain.append(m)
+    messages = [{"role": "user", "content": [
+        {"type": "text", "text": prompt},
+        {"type": "image_url", "image_url": {"url": image_url}},
+    ]}]
+    last: Exception | None = None
+    for m in chain:
+        try:
+            return chat(messages, model=m, max_tokens=max_tokens, temperature=temperature,
+                        timeout=timeout, retries=retries, use_fallback_chain=False)
+        except Exception as e:
+            last = e
+            logger.warning("vision model %s failed (%s); trying next", m, e)
+    raise LLMError(f"all vision models failed; last error: {last}")
+
+
 def complete_with_tools(
     messages: list[dict],
     tools: list[dict],

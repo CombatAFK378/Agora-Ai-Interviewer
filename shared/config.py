@@ -30,6 +30,17 @@ class Settings(BaseSettings):
     llm_fast_model: str = "groq:openai/gpt-oss-120b"      # candidate is waiting
     llm_reasoning_model: str = "openrouter:minimax/minimax-m3:free"
     llm_fallback_chain: str = ""                          # comma-separated ids
+    # Coding round (§8) vision models — gpt-oss is text-only, so these must be
+    # image-capable. Two tiers: a FAST one for live screen reads mid-interview, and
+    # a bigger one for the scoring pass at conclude (latency-insensitive). Both
+    # verified free + vision-capable on OpenRouter (Gemma 4, no reasoning overhead).
+    # No fallback chain (text models can't see) — coding degrades to verbal on fail.
+    llm_vision_fast: str = "openrouter:google/gemma-4-26b-a4b-it:free"
+    llm_vision_model: str = "openrouter:google/gemma-4-31b-it:free"
+    # Free vision tiers rate-limit (429) often, so a vision read falls through this
+    # chain before giving up (all verified free + image-capable on OpenRouter).
+    llm_vision_fallbacks: str = ("openrouter:google/gemma-4-31b-it:free,"
+                                 "openrouter:minimax/minimax-m3:free")
 
     # Smart Turn v3.1 end-of-turn detection
     smart_turn_model_path: str = "models/smart-turn-v3.1.onnx"
@@ -62,6 +73,11 @@ class Settings(BaseSettings):
     audio_sample_rate: int = 16000
     media_worker_port: int = 8080
 
+    # Phase 8: where locked interviews are persisted (one JSON per interview), so
+    # the recruiter dashboard can list past candidates and rejoin. Mounted as a
+    # volume in docker-compose so it survives container rebuilds.
+    data_dir: str = "/app/data"
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
@@ -72,6 +88,11 @@ class Settings(BaseSettings):
     def fallback_models(self) -> list[str]:
         """Parsed fallback chain: primary tried first, then these in order."""
         return [m.strip() for m in self.llm_fallback_chain.split(",") if m.strip()]
+
+    @property
+    def vision_fallbacks(self) -> list[str]:
+        """Extra vision models tried (in order) if the primary vision model fails."""
+        return [m.strip() for m in self.llm_vision_fallbacks.split(",") if m.strip()]
 
     @property
     def groq_keys(self) -> list[str]:

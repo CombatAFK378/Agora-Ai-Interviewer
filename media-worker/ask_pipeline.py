@@ -24,7 +24,7 @@ import tts
 
 from pipeline import (MIN_SPEECH_RMS, PENDING_MAX_SECS, PENDING_TIMEOUT_SECS,
                       _is_filler, _rms)
-from shared import ask_panel, prompts
+from shared import ask_panel, prompts, store
 from shared.config import Settings
 from shared.models import REC_DECLINE, REC_PROCEED, REC_PROCEED_FLAGGED
 
@@ -254,6 +254,10 @@ class AskPipeline:
             if ov_intent is not None:
                 decision, reason = ov_intent
                 ov = ask_panel.override(self.record, decision, reason)
+                try:                       # persist so the dashboard reflects it (§11)
+                    store.save_record(self.record)
+                except Exception:
+                    logger.exception("failed to persist voice override")
                 self._emit({"type": "override", "override": ov.model_dump()})
                 orig = ov.original_recommendation.replace("_", " ").lower()
                 new = ov.decision.replace("_", " ").lower()

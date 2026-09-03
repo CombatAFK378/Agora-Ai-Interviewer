@@ -25,7 +25,7 @@ from pydantic import BaseModel
 from shared.config import get_settings
 from shared.agora_token import build_rtc_token
 from shared.models import AskAnswer, Dossier, InterviewReport, Override, SessionStartResponse, WhatIfQuery
-from shared import ask_panel, dossier as dossier_mod, prompts, scoring
+from shared import ask_panel, dossier as dossier_mod, prompts, scoring, store
 
 from agora_session import AgoraSession
 from pipeline import InterviewPipeline
@@ -58,6 +58,10 @@ class StartRequest(BaseModel):
 class DossierRequest(BaseModel):
     jd: str = ""
     resume: str = ""
+
+
+class JoinRequest(BaseModel):
+    interview_id: str | None = None   # revive a stored interview; else the last one
 
 
 class AskRequest(BaseModel):
@@ -266,6 +270,19 @@ def session_start(req: StartRequest | None = None):
     )
 
 
+class FrameRequest(BaseModel):
+    frame: str   # data: URI of a screen-share JPEG/PNG
+
+
+@app.post("/coding/frame")
+def coding_frame(req: FrameRequest):
+    """Latest screen-share frame from the browser during the coding round (§8)."""
+    if _pipeline is None:
+        raise HTTPException(409, "no active session")
+    _pipeline.set_frame(req.frame)
+    return {"status": "ok"}
+
+
 @app.post("/session/interrupt")
 def session_interrupt():
     """Candidate pressed the Interrupt button — cut the interviewer off now."""
@@ -283,6 +300,7 @@ def session_conclude():
     if _pipeline is None:
         raise HTTPException(409, "no active session")
     _pipeline.freeze()
+    _pipeline.assess_coding()   # §8: thorough vision pass on the final screen → coding evidence
     transcript, claims, coverage, panel, contexts = _pipeline.report_inputs()
     if not any(t.speaker == "candidate" for t in transcript):
         raise HTTPException(400, "no candidate answers to score yet")
@@ -290,21 +308,41 @@ def session_conclude():
     logger.info("concluding interview %s", _pipeline.interview_id)
     _report = scoring.build_report(_pipeline.interview_id, panel, transcript, claims,
                                    coverage, contexts)
+    _report.trajectory = _pipeline.trajectory()   # per-turn confidence chart (§11)
     # Retain the full record so the recruiter can interrogate it (Phase 6).
     _panel_record = ask_panel.PanelRecord(
         interview_id=_pipeline.interview_id, report=_report,
         transcript=transcript, claims=claims, contexts=contexts,
         audit=[a.model_dump() for a in _pipeline.audit],
     )
+    # Persist for the recruiter dashboard (§11) — survives restarts.
+    try:
+        store.save_record(
+            _panel_record,
+            candidate_name=(_dossier.candidate_name if _dossier else ""),
+            role=(_dossier.role if _dossier else ""),
+        )
+    except Exception:
+        logger.exception("failed to persist interview %s", _pipeline.interview_id)
     return _report
 
 
 @app.post("/panel/join", response_model=SessionStartResponse)
-def panel_join():
+def panel_join(req: JoinRequest | None = None):
     """Voice Ask the Panel (§7): the recruiter joins a channel and talks to the
     panel about the locked record. Tears down the interview session and starts a
-    recruiter Q&A session on a fresh channel."""
-    global _session, _pipeline, _ask_pipeline
+    recruiter Q&A session on a fresh channel.
+
+    With an `interview_id`, revives that stored interview (dashboard rejoin);
+    otherwise uses the interview just concluded in this process."""
+    global _session, _pipeline, _ask_pipeline, _panel_record
+    req = req or JoinRequest()
+    if req.interview_id and (_panel_record is None
+                             or _panel_record.interview_id != req.interview_id):
+        loaded = store.load_record(req.interview_id)
+        if loaded is None:
+            raise HTTPException(404, "interview not found")
+        _panel_record = loaded
     if _panel_record is None:
         raise HTTPException(409, "no locked report yet — finish & score first")
     settings = get_settings()
@@ -344,7 +382,9 @@ def panel_counterfactual(req: CounterfactualRequest):
     if _panel_record is None:
         raise HTTPException(409, "no locked report yet")
     try:
-        return ask_panel.counterfactual(_panel_record, req.turn, req.hypothetical, req.agent_id)
+        wq = ask_panel.counterfactual(_panel_record, req.turn, req.hypothetical, req.agent_id)
+        _persist_panel_record()
+        return wq
     except ValueError as e:
         raise HTTPException(400, str(e))
 
@@ -354,7 +394,18 @@ def panel_override(req: OverrideRequest):
     """Log a recruiter override (§7). The original recommendation is kept."""
     if _panel_record is None:
         raise HTTPException(409, "no locked report yet")
-    return ask_panel.override(_panel_record, req.decision, req.reason)
+    ov = ask_panel.override(_panel_record, req.decision, req.reason)
+    _persist_panel_record()
+    return ov
+
+
+def _persist_panel_record():
+    """Re-save the current record (metadata preserved) after a mutation."""
+    if _panel_record is not None:
+        try:
+            store.save_record(_panel_record)
+        except Exception:
+            logger.exception("failed to persist override/what-if")
 
 
 @app.get("/report", response_model=InterviewReport)
@@ -362,6 +413,28 @@ def get_report():
     if _report is None:
         raise HTTPException(404, "no report yet")
     return _report
+
+
+# ---- Recruiter dashboard (Phase 8, §11) --------------------------------
+
+@app.get("/interviews")
+def list_interviews():
+    """Rows for the recruiter dashboard: past interviews, newest first."""
+    return store.list_summaries()
+
+
+@app.post("/interviews/{interview_id}/open", response_model=InterviewReport)
+def open_interview(interview_id: str):
+    """Open a stored interview: make it the active record (so Ask-the-Panel,
+    override, counterfactual and voice-join all operate on it) and return its
+    locked report."""
+    global _panel_record, _report
+    rec = store.load_record(interview_id)
+    if rec is None:
+        raise HTTPException(404, "interview not found")
+    _panel_record = rec
+    _report = rec.report
+    return rec.report
 
 
 @app.post("/session/stop")

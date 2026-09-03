@@ -20,6 +20,7 @@ mic) stops whoever is speaking and truncates their turn at the character heard.
 Transcript, audit and floor state live in memory for now; the storage layer and
 the extraction of the Orchestrator into its own service come later.
 """
+import json
 import logging
 import queue
 import re
@@ -55,6 +56,9 @@ BARGEIN_GRACE_SECS = 1.0
 # Question generation reads the recent thread (the full transcript is still kept
 # for scoring/dashboard). Larger than the bid window so questions stay coherent.
 QUESTION_CONTEXT_TURNS = 16
+# Coding round (§8): how often Liam proactively looks at the screen and comments
+# while the candidate codes, between their spoken turns.
+CODING_WATCH_SECS = 22.0
 
 
 class InterviewPipeline:
@@ -70,6 +74,10 @@ class InterviewPipeline:
         # and résumé claims. Falls back to the full panel / defaults if absent.
         self.dossier = dossier
         self.panel = list(dossier.panel) if (dossier and dossier.panel) else list(prompts.PANEL_IDS)
+        # `panel` is the LIVE panel (Liam is removed from it once the coding round
+        # wraps); `_full_panel` is everyone who participated, used for scoring so
+        # Liam is still scored on the coding evidence at the end (§8).
+        self._full_panel = list(self.panel)
         self._competencies = _derive_competencies(dossier, self.panel)
         # Lean context (role + focus + rubric) for the token-hot paths (bids, scoring);
         # rich context (adds the candidate's résumé highlights) for question generation.
@@ -109,6 +117,21 @@ class InterviewPipeline:
         self.audit: list[AuditEvent] = []
         self._tx_lock = threading.Lock()
         self._seq = 0
+        # Confidence trajectory (§11 Phase 8): a coverage snapshot per turn, so the
+        # report can chart how the panel's evidence built up over the interview.
+        self._trajectory: list[dict] = []
+
+        # Coding round (§8): Liam issues ONE live task, the candidate shares their
+        # screen, frames stream in here. A FAST vision model reads the latest frame
+        # to ground Liam's live follow-ups; a thorough pass at conclude scores it.
+        self._frame: str | None = None            # latest screen frame (data: URI)
+        self._frame_lock = threading.Lock()
+        self._coding_task: str | None = None       # the one task Liam set
+        self._coding_in_panel = "coding" in self.panel
+        self._coding_mode = False                  # round active → floor locked to Liam
+        self._coding_done = False                  # round wrapped → Liam off the panel
+        self._coding_lock = threading.Lock()       # one Liam coding turn at a time
+        self._coding_thread: threading.Thread | None = None
 
         # UI/speaker signals (wired to a WebSocket by main; None = just log).
         self.on_event: Optional[Callable[[dict], None]] = None
@@ -154,8 +177,10 @@ class InterviewPipeline:
         """Snapshot the full record for scoring: (transcript, claims, coverage, panel, contexts)."""
         with self._tx_lock:
             transcript = [t.model_copy() for t in self.transcript]
+        # Score everyone who participated (incl. Liam even after he left the live
+        # panel), not just whoever is still live.
         return (transcript, self.ledger.claims(), self.ledger.coverage(),
-                list(self.panel), dict(self.contexts))
+                list(self._full_panel), dict(self.contexts))
 
     def request_interrupt(self) -> bool:
         """Manual barge-in from the candidate's Interrupt button."""
@@ -270,6 +295,12 @@ class InterviewPipeline:
     def _panel_reply(self):
         snapshot = self._snapshot_transcript()
 
+        # Coding round is a locked phase (§8): while it's on, Liam owns the floor —
+        # no bidding, no switching to other interviewers — until he wraps it.
+        if self._coding_mode:
+            self._coding_turn(snapshot)
+            return
+
         # A clarification ("can you repeat?", "I didn't get it") is not a new
         # answer — the SAME interviewer should rephrase, not open the floor.
         last_cand = next((t.text for t in reversed(snapshot) if t.speaker == "candidate"), "")
@@ -296,6 +327,7 @@ class InterviewPipeline:
         self._ingest_claims(bids, snapshot)
         self.floor.set_coverage(self.ledger.coverage())
         self._emit_ledger()
+        self._record_trajectory()
 
         decision = self.floor.decide(bids)
 
@@ -313,6 +345,12 @@ class InterviewPipeline:
             "bids": {a: {"interest": bids[a].interest, "reason": bids[a].reason} for a in self.panel},
             "coverage": {k: round(v, 3) for k, v in self.ledger.coverage().items()},
         })
+
+        # First time Liam takes the floor, kick off the locked coding round (§8)
+        # instead of a normal question.
+        if decision.winner == "coding" and self._coding_task is None:
+            self._enter_coding_round()
+            return
 
         pivot = (
             "The panel has little left to ask on the current thread. Change "
@@ -338,6 +376,191 @@ class InterviewPipeline:
         except Exception:
             logger.exception("question generation failed for %s; staying silent", agent_id)
             return ""
+
+    # ---- coding round (§8) -------------------------------------------------
+
+    def set_frame(self, data_url: str) -> None:
+        """Store the latest screen-share frame (a data: URI) from the browser."""
+        with self._frame_lock:
+            self._frame = data_url
+
+    def _get_frame(self) -> str | None:
+        with self._frame_lock:
+            return self._frame
+
+    def _enter_coding_round(self):
+        """Liam sets the ONE task and locks the floor to himself (§8)."""
+        self._coding_mode = True
+        try:
+            task = llm_router.chat(
+                prompts.build_coding_task_prompt(self.q_contexts.get("coding", "")),
+                model=self.settings.llm_fast_model, max_tokens=320,
+                temperature=0.6, reasoning_effort="low",
+            ).strip()
+        except Exception:
+            logger.exception("coding task generation failed; using a generic one")
+            task = ("Let's do a quick live coding exercise. Please share your screen and "
+                    "open an editor, then write a function that returns the two indices in "
+                    "a list that add up to a target. Think out loud as you go.")
+        self._coding_task = task
+        self._emit({"type": "coding_task", "text": task})   # UI nudges screen share
+        logger.info("coding round: task set, floor locked to Liam")
+        self._speak_and_wait("coding", task)
+        self.floor.record("coding")
+        # Watch loop: Liam proactively looks at the screen and comments while the
+        # candidate codes, even between their spoken turns (§8).
+        self._coding_thread = threading.Thread(target=self._coding_loop, daemon=True,
+                                               name="coding-watch")
+        self._coding_thread.start()
+
+    def _coding_loop(self):
+        """While the round is on, comment on the screen every CODING_WATCH_SECS —
+        so Liam stays engaged instead of going silent between the candidate's turns."""
+        while self._coding_mode and not self._stop.is_set() and not self._concluded:
+            waited = 0.0
+            while (waited < CODING_WATCH_SECS and self._coding_mode
+                   and not self._stop.is_set() and not self._concluded):
+                time.sleep(0.5)
+                waited += 0.5
+            if not self._coding_mode:
+                break
+            # Don't cut in while anyone is mid-turn.
+            if self.session.is_speaking() or self._pending:
+                continue
+            self._do_coding_turn("")   # proactive: no new candidate utterance
+
+    def _screen_read(self) -> str:
+        """Fast vision read of the current screen (with fallback chain). Best-effort —
+        a failed read returns a marker, and Liam adapts verbally."""
+        frame = self._get_frame()
+        if not frame:
+            return "(No screen shared yet.)"
+        try:
+            read = llm_router.see(
+                "You are watching a candidate's screen during a live coding interview. In "
+                f"1-2 sentences describe ONLY what is actually visible: the code / language / "
+                "approach, and any obvious bug. IMPORTANT: explicitly note if any AI chat "
+                "assistant (ChatGPT, Claude, Copilot, Gemini, Perplexity) is open or visible.",
+                frame, model=self.settings.llm_vision_fast, max_tokens=180, timeout=8.0,
+                retries=0,   # live: fail fast through the chain, don't stack backoffs
+            ).strip()
+            self._emit({"type": "screen_read", "text": read})
+            return read or "(Screen shared but nothing readable.)"
+        except Exception as e:
+            logger.warning("live screen read unavailable (%s)", type(e).__name__)
+            return "(Screen not readable right now.)"
+
+    def _coding_turn(self, snapshot: list[TranscriptTurn]):
+        """Candidate-triggered Liam turn inside the coding round."""
+        cand = next((t.text for t in reversed(snapshot) if t.speaker == "candidate"), "")
+        self._do_coding_turn(cand)
+
+    def _do_coding_turn(self, candidate_text: str):
+        """One Liam turn in the locked round — read the screen, react, decide. Serialized
+        so the watch loop and candidate turns never talk over each other."""
+        if not self._coding_lock.acquire(blocking=False):
+            return          # another coding turn is in flight; skip this one
+        try:
+            if not self._coding_mode:
+                return
+            self._emit({"type": "thinking"})
+            screen = self._screen_read()
+            say, verdict = self._coding_decide(candidate_text, screen)
+            # Cheating requires ACTUAL screen evidence (an AI tool named in the read) —
+            # never a guess from a blank/unreadable screen or a flaky model.
+            screen_shows_cheating = _looks_like_cheating(screen)
+            if verdict == "cheating" and not screen_shows_cheating:
+                verdict = "continue"
+            if screen_shows_cheating:
+                verdict = "cheating"
+                if not say:
+                    say = ("I can see an AI assistant open on your screen — that's not "
+                           "allowed for the core logic. That settles my read on this round; "
+                           "I'll hand back to the rest of the panel.")
+            if not say:
+                say = "Keep going — talk me through what you're writing."
+            if not self._coding_mode:      # round may have ended while we thought
+                return
+            self._speak_and_wait("coding", say)
+            self.floor.record("coding")
+            if verdict in ("done", "cheating"):
+                self._end_coding_round(verdict, screen)
+        finally:
+            self._coding_lock.release()
+
+    def _coding_decide(self, candidate_text: str, screen: str) -> tuple[str, str]:
+        """Ask the fast model for Liam's spoken line + a verdict. Text model (Groq),
+        so it's reliable even when vision is flaky."""
+        try:
+            raw = llm_router.chat(
+                prompts.build_coding_turn_prompt(self._coding_task, screen, candidate_text,
+                                                 self.q_contexts.get("coding", "")),
+                model=self.settings.llm_fast_model, max_tokens=240,
+                temperature=0.5, reasoning_effort="low",
+            )
+            m = re.search(r"\{.*\}", raw, re.DOTALL)
+            data = json.loads(m.group(0)) if m else {}
+            say = str(data.get("say", "")).strip()
+            verdict = str(data.get("verdict", "continue")).strip().lower()
+            if verdict not in ("continue", "done", "cheating"):
+                verdict = "continue"
+            return say, verdict
+        except Exception:
+            logger.exception("coding decide failed; continuing")
+            return "", "continue"
+
+    def _end_coding_round(self, verdict: str, screen: str):
+        """Wrap the coding round: record evidence and drop Liam from the panel so the
+        rest of the interview continues without him (§8)."""
+        self._coding_mode = False
+        self._coding_done = True
+        self.panel = [a for a in self.panel if a != "coding"]
+        self.floor.panel_ids = [a for a in self.floor.panel_ids if a != "coding"]
+        if verdict == "cheating":
+            self.ledger.add(
+                text=f"Coding round: candidate used an AI assistant / outside help "
+                     f"(screen: {screen[:140]}). Integrity flag — coding not demonstrated.",
+                competency="coding", source_turn=self._seq, strength=0.9,
+                status="SOLID", noticed_by="vision")
+        else:
+            self.ledger.add(
+                text=f"Coding round (final screen): {screen[:180]}",
+                competency="coding", source_turn=self._seq, strength=0.7,
+                status="SOLID", noticed_by="vision")
+        self._emit({"type": "coding_done", "verdict": verdict})
+        logger.info("coding round ended: verdict=%s; Liam removed from panel", verdict)
+
+    def assess_coding(self) -> None:
+        """Conclude-time safety net (§8): if the round never formally wrapped (e.g. the
+        interview ended mid-task), do one thorough vision read so coding isn't blank.
+        If the round already ended, evidence is recorded — nothing to do."""
+        if self._coding_done or not (self._coding_in_panel and self._coding_task):
+            return
+        frame = self._get_frame()
+        if not frame:
+            self.ledger.add(text="Coding task set but the candidate never shared a screen / wrote code.",
+                            competency="coding", source_turn=self._seq, strength=0.3,
+                            status="VAGUE", noticed_by="vision")
+            return
+        try:
+            read = llm_router.see(
+                "Assess a candidate's screen at the END of a live coding task. "
+                f"The task was: {self._coding_task}\n"
+                "Judge ONLY what is visible. In 2-3 sentences: did they produce a working "
+                "solution, what approach, and note correctness, edge cases, quality. Also "
+                "note if an AI assistant is visible (that would be cheating). Be fair.",
+                frame, model=self.settings.llm_vision_model, max_tokens=300, timeout=60.0,
+            ).strip()
+            if read:
+                cheat = _looks_like_cheating(read)
+                self.ledger.add(
+                    text=(f"Coding round (final screen): {read}" if not cheat else
+                          f"Coding round: AI assistant visible — integrity flag. {read}"),
+                    competency="coding", source_turn=self._seq,
+                    strength=0.9 if cheat else 0.7, status="SOLID", noticed_by="vision")
+                logger.info("coding vision assessment recorded (conclude)")
+        except Exception:
+            logger.exception("coding vision assessment failed; no coding evidence added")
 
     def _speak_and_wait(self, agent_id: str, text: str):
         self._speak(agent_id, text)
@@ -462,6 +685,25 @@ class InterviewPipeline:
             "contradictions": len(self.ledger.contradictions()),
         })
 
+    def _record_trajectory(self):
+        """Snapshot per-competency coverage at the current turn, plus the panel-wide
+        mean and how much of the evidence is SOLID. Charted in the report (§11)."""
+        cov = self.ledger.coverage()
+        claims = self.ledger.claims()
+        solid = sum(1 for c in claims if c.status == "SOLID")
+        per = {c.key: round(cov.get(c.key, 0.0), 3) for c in self._competencies}
+        mean = round(sum(per.values()) / len(per), 3) if per else 0.0
+        self._trajectory.append({
+            "turn": self._seq,
+            "mean": mean,
+            "coverage": per,
+            "claims": len(claims),
+            "solid": solid,
+        })
+
+    def trajectory(self) -> list[dict]:
+        return list(self._trajectory)
+
 
 # ---- helpers ---------------------------------------------------------------
 
@@ -496,6 +738,19 @@ def _rms(pcm_bytes: bytes) -> float:
         return 0.0
     samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32)
     return float(np.sqrt(np.mean(samples * samples)))
+
+
+_CHEAT_TERMS = (
+    "chatgpt", "chat gpt", "openai", "claude", "copilot", "gemini", "bard",
+    "perplexity", "phind", "you.com", "ai assistant", "ai chat",
+)
+
+
+def _looks_like_cheating(screen_text: str) -> bool:
+    """Deterministic backstop: an AI assistant named in the screen read = cheating,
+    regardless of what the model concluded."""
+    t = (screen_text or "").lower()
+    return any(term in t for term in _CHEAT_TERMS)
 
 
 def _derive_competencies(dossier: Optional[Dossier], panel: list[str]) -> list[Competency]:

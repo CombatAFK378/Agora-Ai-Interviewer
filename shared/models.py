@@ -144,6 +144,7 @@ class InterviewReport(BaseModel):
     conclusion: PanelConclusion
     coverage: dict[str, float] = Field(default_factory=dict)
     locked_hash: str = ""                      # SHA-256 of the canonical record
+    trajectory: list = Field(default_factory=list)  # per-turn coverage snapshots (§11)
 
 
 # ---- Phase 6: Ask the Panel (§7) ----------------------------------------

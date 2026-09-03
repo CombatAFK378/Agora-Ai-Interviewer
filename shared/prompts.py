@@ -253,6 +253,65 @@ def build_agent_prompt(
     return [{"role": "system", "content": system}] + _render_transcript(agent_id, transcript)
 
 
+_CODING_TASK_RULES = (
+    "\n\nKick off the ONE live coding exercise. Speak it, warm and TIGHT — at most 3 "
+    "short sentences, and finish your sentences (don't trail off):\n"
+    "1. Ask them to share their screen and open a code editor.\n"
+    "2. State ONE small, self-contained problem, solvable in a few minutes, pitched to "
+    "this role and level. One or two sentences MAX for the problem — keep it crisp.\n"
+    "3. Ask them to think out loud.\n"
+    "Plain spoken words only — no code, no markdown, no lists. Be concise; a long "
+    "rambling task is bad."
+)
+
+
+def build_coding_task_prompt(context: str = "") -> list[dict]:
+    """Prompt for Liam to set the single live coding task (§8)."""
+    agent = AGENTS["coding"]
+    system = agent.persona + (f"\n\n{context}" if context else "") + _CODING_TASK_RULES
+    return [{"role": "system", "content": system},
+            {"role": "user", "content": "Set the coding task now, concisely."}]
+
+
+_CODING_TURN_RULES = (
+    "\n\nYou are actively watching the candidate work through the ONE live coding task — "
+    "like a real engineer looking over their shoulder. You're given the task, what's on "
+    "their screen right now (from a vision model — may be rough or unavailable), and what "
+    "they last said (often nothing — they're coding).\n\n"
+    "DEFAULT to staying with them (\"continue\"). Your job is to keep the room warm and "
+    "engaged: react to what you SEE on screen ('nice, you've set up the function signature', "
+    "'I see you're looping over the docs now'), give a light nudge if they're stuck, and "
+    "answer any question they ask. If they ask whether they can use Google/an AI tool: "
+    "Google or official docs for SYNTAX is fine, but the core logic must be their own — no "
+    "AI assistants. If you genuinely can't see the screen, encourage them to talk you "
+    "through what they're writing. Do NOT end the round just because progress is slow.\n\n"
+    "Only pick a non-continue verdict when it's clearly warranted:\n"
+    "- \"done\": ONLY if they explicitly say they're finished / stuck / want to move on, OR "
+    "the screen clearly shows a complete, working solution to the task. Then briefly note "
+    "how it went and hand back to the panel.\n"
+    "- \"cheating\": ONLY if an AI assistant (ChatGPT, Claude, Copilot, Gemini, Perplexity) "
+    "is actually visible on screen, or a full solution is clearly pasted in. Never guess "
+    "this from a blank or unreadable screen. Say — kindly but firmly, not hostile — that "
+    "you can see it, that it settles your read on this round, and that you'll hand back to "
+    "the panel.\n\n"
+    "Spoken, 1-2 short sentences, no markdown. Output ONLY JSON:\n"
+    '{"say": "<what you say out loud>", "verdict": "continue|done|cheating"}'
+)
+
+
+def build_coding_turn_prompt(task: str, screen: str, candidate_text: str,
+                             context: str = "") -> list[dict]:
+    """Prompt for Liam's turn DURING the coding round — returns his spoken line and a
+    verdict (continue/done/cheating) (§8)."""
+    agent = AGENTS["coding"]
+    system = agent.persona + (f"\n\n{context}" if context else "") + _CODING_TURN_RULES
+    user = (f"THE TASK YOU SET: {task}\n\n"
+            f"ON THE CANDIDATE'S SCREEN RIGHT NOW: {screen}\n\n"
+            f"THE CANDIDATE JUST SAID: \"{candidate_text or '(nothing — still working)'}\"\n\n"
+            "Respond with ONLY the JSON.")
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
 def _flatten_transcript(transcript: list[TranscriptTurn]) -> str:
     lines = []
     for t in transcript:
