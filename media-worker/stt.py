@@ -18,6 +18,9 @@ logger = logging.getLogger(__name__)
 
 SARVAM_STT_URL = "https://api.sarvam.ai/speech-to-text"
 _RETRYABLE_STATUS = {408, 425, 429, 500, 502, 503, 504}
+# Sarvam's sync STT rejects audio longer than ~30 s (400). Split long turns into
+# pieces just under that and stitch the transcripts back together.
+STT_MAX_SECS = 29
 
 
 def _pcm_to_wav(pcm_bytes: bytes, sample_rate: int) -> bytes:
@@ -37,6 +40,28 @@ def transcribe(
     model: str = "saaras:v3",
     language_code: str = "en-IN",
     retries: int = 2,
+) -> str:
+    """Transcribe an utterance. Turns longer than Sarvam's ~30 s limit are split
+    into ≤29 s chunks and the transcripts joined, so a long monologue isn't lost."""
+    max_bytes = STT_MAX_SECS * sample_rate * 2
+    if len(pcm_bytes) > max_bytes:
+        parts = []
+        for i in range(0, len(pcm_bytes), max_bytes):
+            piece = _transcribe_one(pcm_bytes[i:i + max_bytes], api_key,
+                                    sample_rate, model, language_code, retries)
+            if piece:
+                parts.append(piece)
+        return " ".join(parts).strip()
+    return _transcribe_one(pcm_bytes, api_key, sample_rate, model, language_code, retries)
+
+
+def _transcribe_one(
+    pcm_bytes: bytes,
+    api_key: str,
+    sample_rate: int,
+    model: str,
+    language_code: str,
+    retries: int,
 ) -> str:
     wav_bytes = _pcm_to_wav(pcm_bytes, sample_rate)
     for attempt in range(retries + 1):

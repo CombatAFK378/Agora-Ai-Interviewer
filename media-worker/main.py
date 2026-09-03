@@ -19,20 +19,23 @@ import uuid
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 from shared.config import get_settings
 from shared.agora_token import build_rtc_token
-from shared.models import InterviewReport, SessionStartResponse
-from shared import prompts, scoring
+from shared.models import AskAnswer, InterviewReport, Override, SessionStartResponse, WhatIfQuery
+from shared import ask_panel, prompts, scoring
 
 from agora_session import AgoraSession
 from pipeline import InterviewPipeline
+from ask_pipeline import AskPipeline
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("media-worker")
 
 BOT_UID = 1
 CANDIDATE_UID = 100
+RECRUITER_UID = 200
 TOKEN_TTL_SECONDS = 3600
 
 app = FastAPI(title="968ms media worker")
@@ -40,7 +43,26 @@ app = FastAPI(title="968ms media worker")
 # Held for the lifetime of the single active session.
 _session: AgoraSession | None = None
 _pipeline: InterviewPipeline | None = None
+_ask_pipeline: AskPipeline | None = None   # voice Ask the Panel (Phase 6)
 _report: InterviewReport | None = None   # last locked report (Phase 5)
+_panel_record: ask_panel.PanelRecord | None = None   # for Ask the Panel (Phase 6)
+
+
+class AskRequest(BaseModel):
+    question: str
+    mode: str = "open"           # open | addressed
+    target: str | None = None    # agent id, if addressed
+
+
+class CounterfactualRequest(BaseModel):
+    turn: int
+    hypothetical: str
+    agent_id: str
+
+
+class OverrideRequest(BaseModel):
+    decision: str
+    reason: str = ""
 
 # The built Vite app (dist/). In Docker this is set to /app/web/dist. For local
 # frontend dev, run `npm run dev` instead (Vite serves the app and proxies here).
@@ -124,7 +146,7 @@ def health():
 
 @app.post("/session/start", response_model=SessionStartResponse)
 def session_start():
-    global _session, _pipeline
+    global _session, _pipeline, _report, _panel_record
     settings = get_settings()
 
     missing = [
@@ -141,8 +163,10 @@ def session_start():
     if missing:
         raise HTTPException(500, f"Missing config: {', '.join(missing)}")
 
-    # Tear down any previous session (one per process).
+    # Tear down any previous session (one per process) and clear the last report.
     _teardown()
+    _report = None
+    _panel_record = None
 
     interview_id = uuid.uuid4().hex[:12]
     channel = f"iv-{interview_id[:8]}"
@@ -206,9 +230,74 @@ def session_conclude():
     transcript, claims, coverage, panel = _pipeline.report_inputs()
     if not any(t.speaker == "candidate" for t in transcript):
         raise HTTPException(400, "no candidate answers to score yet")
+    global _panel_record
     logger.info("concluding interview %s", _pipeline.interview_id)
     _report = scoring.build_report(_pipeline.interview_id, panel, transcript, claims, coverage)
+    # Retain the full record so the recruiter can interrogate it (Phase 6).
+    _panel_record = ask_panel.PanelRecord(
+        interview_id=_pipeline.interview_id, report=_report,
+        transcript=transcript, claims=claims,
+        audit=[a.model_dump() for a in _pipeline.audit],
+    )
     return _report
+
+
+@app.post("/panel/join", response_model=SessionStartResponse)
+def panel_join():
+    """Voice Ask the Panel (§7): the recruiter joins a channel and talks to the
+    panel about the locked record. Tears down the interview session and starts a
+    recruiter Q&A session on a fresh channel."""
+    global _session, _pipeline, _ask_pipeline
+    if _panel_record is None:
+        raise HTTPException(409, "no locked report yet — finish & score first")
+    settings = get_settings()
+
+    _teardown()  # the interview is over; reclaim the single AgoraService
+
+    channel = f"ask-{_panel_record.interview_id[:8]}"
+    bot_token = build_rtc_token(settings.agora_app_id, settings.agora_app_certificate,
+                                channel, BOT_UID, TOKEN_TTL_SECONDS)
+    recruiter_token = build_rtc_token(settings.agora_app_id, settings.agora_app_certificate,
+                                      channel, RECRUITER_UID, TOKEN_TTL_SECONDS)
+
+    session = AgoraSession(app_id=settings.agora_app_id, channel=channel,
+                           bot_uid=BOT_UID, token=bot_token, sample_rate=settings.audio_sample_rate)
+    ask = AskPipeline(session=session, settings=settings, record=_panel_record,
+                      on_event=_broker.publish)
+    session.set_on_user_joined(ask.on_recruiter_joined)
+    session.start()
+    ask.start()
+    _session, _ask_pipeline = session, ask
+    logger.info("panel voice session started on channel %s", channel)
+    return SessionStartResponse(app_id=settings.agora_app_id, channel=channel,
+                                uid=RECRUITER_UID, token=recruiter_token)
+
+
+@app.post("/panel/ask", response_model=AskAnswer)
+def panel_ask(req: AskRequest):
+    """Ask the Panel (§7): grounded Q&A over the locked record."""
+    if _panel_record is None:
+        raise HTTPException(409, "no locked report yet — finish & score first")
+    return ask_panel.answer(_panel_record, req.question, req.mode, req.target)
+
+
+@app.post("/panel/counterfactual", response_model=WhatIfQuery)
+def panel_counterfactual(req: CounterfactualRequest):
+    """Counterfactual re-score (§7) — never mutates the locked scores."""
+    if _panel_record is None:
+        raise HTTPException(409, "no locked report yet")
+    try:
+        return ask_panel.counterfactual(_panel_record, req.turn, req.hypothetical, req.agent_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/panel/override", response_model=Override)
+def panel_override(req: OverrideRequest):
+    """Log a recruiter override (§7). The original recommendation is kept."""
+    if _panel_record is None:
+        raise HTTPException(409, "no locked report yet")
+    return ask_panel.override(_panel_record, req.decision, req.reason)
 
 
 @app.get("/report", response_model=InterviewReport)
@@ -225,10 +314,13 @@ def session_stop():
 
 
 def _teardown():
-    global _session, _pipeline
+    global _session, _pipeline, _ask_pipeline
     if _pipeline is not None:
         _pipeline.stop()
         _pipeline = None
+    if _ask_pipeline is not None:
+        _ask_pipeline.stop()
+        _ask_pipeline = None
     if _session is not None:
         _session.stop()
         _session = None

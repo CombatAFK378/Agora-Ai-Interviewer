@@ -131,6 +131,55 @@ def chat(
     raise LLMError(f"all models failed; last error: {last_err}")
 
 
+def complete_with_tools(
+    messages: list[dict],
+    tools: list[dict],
+    *,
+    model: str | None = None,
+    temperature: float = 0.3,
+    max_tokens: int = 400,
+    timeout: float = 30.0,
+    retries: int = 2,
+) -> dict:
+    """Like chat(), but offers `tools` and returns the assistant message dict
+    (which may carry `tool_calls`). Single model + key rotation, no fallback
+    chain — used for the Orchestrator's override tool (§7)."""
+    settings = get_settings()
+    model_id = model or settings.llm_fast_model
+    provider, bare_model = _split(model_id)
+    url, key_attr = PROVIDERS[provider]
+    keys = settings.groq_keys if provider == "groq" else (
+        [getattr(settings, key_attr, "")] if getattr(settings, key_attr, "") else [])
+    if not keys:
+        raise LLMError(f"no key for provider {provider!r}")
+
+    last_err: Exception | None = None
+    for attempt in range(retries + 1):
+        api_key = _next_key(keys)
+        try:
+            resp = requests.post(
+                url,
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={"model": bare_model, "messages": messages, "temperature": temperature,
+                      "max_tokens": max_tokens, "tools": tools, "tool_choice": "auto"},
+                timeout=timeout,
+            )
+            if resp.status_code in _RETRYABLE_STATUS:
+                raise _Transient(f"HTTP {resp.status_code}")
+            resp.raise_for_status()
+            data = resp.json()
+            if isinstance(data, dict) and data.get("error"):
+                raise _Transient(str(data["error"])[:120])
+            return data["choices"][0]["message"]
+        except _Transient as e:
+            last_err = e
+            time.sleep(min(0.5 * (2 ** attempt), 4.0))
+        except Exception as e:
+            last_err = e
+            break
+    raise LLMError(f"tool completion failed: {last_err}")
+
+
 def _split(model_id: str) -> tuple[str, str]:
     """('groq:openai/gpt-oss-120b') -> ('groq', 'openai/gpt-oss-120b').
 

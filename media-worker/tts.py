@@ -21,6 +21,8 @@ from urllib.parse import urlencode
 
 import requests
 
+from shared.config import get_settings
+
 logger = logging.getLogger(__name__)
 
 DEEPGRAM_SPEAK_URL = "https://api.deepgram.com/v1/speak"
@@ -68,14 +70,17 @@ def speak_stream(
     stop early (the turn was interrupted). Falls back to the REST call if the
     WebSocket path is unavailable, so a socket problem never drops a turn.
     """
-    try:
-        return _stream_ws(text, api_key, on_chunk, model, sample_rate, is_active)
-    except Exception:
-        logger.warning("TTS stream failed; falling back to REST", exc_info=True)
-        audio = synthesize(text, api_key, model=model, sample_rate=sample_rate)
-        if audio:
-            on_chunk(audio)
-        return len(audio)
+    if get_settings().tts_use_streaming:
+        try:
+            return _stream_ws(text, api_key, on_chunk, model, sample_rate, is_active)
+        except Exception as e:
+            logger.warning("TTS stream unavailable (%s); using REST this turn", type(e).__name__)
+    # Reliable path: one REST synth of the whole reply, buffered + paced for
+    # smooth playback (default — the streaming socket is flaky from some networks).
+    audio = synthesize(text, api_key, model=model, sample_rate=sample_rate)
+    if audio:
+        on_chunk(audio)
+    return len(audio)
 
 
 def _stream_ws(text, api_key, on_chunk, model, sample_rate, is_active) -> int:
@@ -87,11 +92,14 @@ def _stream_ws(text, api_key, on_chunk, model, sample_rate, is_active) -> int:
         "sample_rate": str(sample_rate),
         "container": "none",
     })
+    # Fast-fail the connect/handshake (~5s) so a flaky socket falls back to REST
+    # quickly instead of freezing the turn; then allow longer reads for streaming.
     ws = websocket.create_connection(
         f"{DEEPGRAM_SPEAK_WS}?{qs}",
         header=[f"Authorization: Token {api_key}"],
-        timeout=30,
+        timeout=4,
     )
+    ws.settimeout(20)
     total = 0
     try:
         ws.send(json.dumps({"type": "Speak", "text": text}))

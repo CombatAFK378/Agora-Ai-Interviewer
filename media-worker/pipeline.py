@@ -123,8 +123,13 @@ class InterviewPipeline:
         self._thread.join(timeout=2)
 
     def freeze(self):
-        """Final bell: stop taking new turns so the record can be scored."""
+        """Final bell: stop taking new turns AND cut off any in-flight speech so
+        no interviewer keeps talking while/after the record is scored."""
         self._concluded = True
+        try:
+            self.session.interrupt()
+        except Exception:
+            pass
 
     def report_inputs(self):
         """Snapshot the full record for scoring: (transcript, claims, coverage, panel)."""
@@ -326,6 +331,8 @@ class InterviewPipeline:
         break. Truncation on interrupt maps delivered vs synthesized bytes to a
         character offset over the full text.
         """
+        if self._concluded:      # the bell rang mid-generation — don't start speaking
+            return
         agent = prompts.AGENTS[agent_id]
         if agent_id in self.panel:
             self._last_speaker = agent_id

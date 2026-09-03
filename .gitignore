@@ -33,6 +33,8 @@ agora_rtc_log/
 # Agora SDK runtime cache
 agora_cache.db
 agoradns.dat
+agorareport.dat
+**/agorareport.dat
 
 # Claude Code local settings
 .claude/

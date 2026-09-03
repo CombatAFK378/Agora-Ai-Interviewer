@@ -128,3 +128,42 @@ class InterviewReport(BaseModel):
     conclusion: PanelConclusion
     coverage: dict[str, float] = Field(default_factory=dict)
     locked_hash: str = ""                      # SHA-256 of the canonical record
+
+
+# ---- Phase 6: Ask the Panel (§7) ----------------------------------------
+
+class Override(BaseModel):
+    """A recruiter's decision to confirm or overrule the panel (§7, §13.10).
+    The original recommendation stays visible forever alongside it."""
+    interview_id: str
+    original_recommendation: str
+    decision: str
+    reason: str
+    locked_hash: str = ""
+    ts: float = Field(default_factory=time.time)
+
+
+class WhatIfQuery(BaseModel):
+    """A counterfactual re-score (§7). Stored separately; NEVER mutates the
+    locked agent_score, so the hash still verifies."""
+    interview_id: str
+    agent_id: str
+    source_turn: int
+    hypothetical: str                          # what the candidate 'instead' said
+    original_overall: float
+    new_overall: float
+    changes: str                               # what would move and why
+    ts: float = Field(default_factory=time.time)
+
+
+class AskAnswer(BaseModel):
+    """A grounded answer to a recruiter question about the locked record. If the
+    recruiter's message was a clear override instruction, the Orchestrator's
+    override tool fires and the resulting Override is attached (§7)."""
+    question: str
+    mode: str                                  # open | addressed
+    target: str | None = None                  # agent id, if addressed
+    answered_by: str                           # agent id / "orchestrator"
+    answer: str
+    override: Override | None = None           # set if the override tool fired
+    ts: float = Field(default_factory=time.time)

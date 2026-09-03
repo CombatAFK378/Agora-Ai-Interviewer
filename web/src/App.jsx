@@ -13,6 +13,7 @@ const initials = (name) => (name || "?").slice(0, 1).toUpperCase();
 export default function App() {
   const [agents, setAgents] = useState([]); // [{id,name,title}]
   const [joined, setJoined] = useState(false);
+  const [talking, setTalking] = useState(false); // in voice with the panel (Phase 6)
   const [status, setStatus] = useState("Idle.");
   const [speaking, setSpeaking] = useState(null); // agent id
   const [thinking, setThinking] = useState(false);
@@ -24,6 +25,17 @@ export default function App() {
   const [showDebug, setShowDebug] = useState(false);
   const [report, setReport] = useState(null);
   const [scoring, setScoring] = useState(false);
+  // Ask the Panel (Phase 6)
+  const [askTarget, setAskTarget] = useState("");
+  const [askQ, setAskQ] = useState("");
+  const [asking, setAsking] = useState(false);
+  const [qa, setQa] = useState([]); // [{q, by, a}]
+  const [cfAgent, setCfAgent] = useState("");
+  const [cfTurn, setCfTurn] = useState("");
+  const [cfHypo, setCfHypo] = useState("");
+  const [ovDecision, setOvDecision] = useState("");
+  const [ovReason, setOvReason] = useState("");
+  const [overrides, setOverrides] = useState([]);
   const [logLines, setLogLines] = useState([]);
   const logRef = useRef(null);
 
@@ -72,6 +84,8 @@ export default function App() {
         setCoverage(ev.coverage || []);
         setClaims(ev.claims || []);
         setContradictions(ev.contradictions || 0);
+      } else if (ev.type === "override" && ev.override) {
+        setOverrides((o) => [...o, ev.override]); // override fired by voice
       }
     };
     sock.onclose = () => log("events socket closed");
@@ -101,6 +115,24 @@ export default function App() {
     return track;
   }
 
+  async function connectAgora(s) {
+    openEvents();
+    client.current = AgoraRTC.createClient({ mode: "rtc", codec: "vp8" });
+    client.current.on("user-published", async (user, mt) => {
+      await client.current.subscribe(user, mt);
+      if (mt === "audio") user.audioTrack.play();
+    });
+    await client.current.join(s.app_id, s.channel, s.token, s.uid);
+    mic.current = await makeMicTrack();
+    await client.current.publish([mic.current]);
+  }
+
+  async function disconnectAgora() {
+    if (ws.current) { ws.current.close(); ws.current = null; }
+    if (mic.current) { mic.current.stop(); mic.current.close(); mic.current = null; }
+    if (client.current) { try { await client.current.leave(); } catch (_) {} client.current = null; }
+  }
+
   async function join() {
     setStatus("Starting session…");
     try {
@@ -108,17 +140,8 @@ export default function App() {
       if (!resp.ok) throw new Error(`${resp.status} ${await resp.text()}`);
       const s = await resp.json();
       log(`channel=${s.channel} uid=${s.uid}`);
-      openEvents();
-
-      client.current = AgoraRTC.createClient({ mode: "rtc", codec: "vp8" });
-      client.current.on("user-published", async (user, mt) => {
-        await client.current.subscribe(user, mt);
-        if (mt === "audio") user.audioTrack.play();
-      });
       setStatus("Joining channel…");
-      await client.current.join(s.app_id, s.channel, s.token, s.uid);
-      mic.current = await makeMicTrack();
-      await client.current.publish([mic.current]);
+      await connectAgora(s);
       setJoined(true);
       setStatus("Live — the panel will greet you shortly.");
       log("🎤 mic published");
@@ -128,26 +151,34 @@ export default function App() {
     }
   }
 
+  async function panelJoin() {
+    setStatus("Joining the panel…");
+    try {
+      await disconnectAgora();          // leave the interview channel first
+      const resp = await fetch("/panel/join", { method: "POST" });
+      if (!resp.ok) throw new Error(`${resp.status} ${await resp.text()}`);
+      const s = await resp.json();
+      await connectAgora(s);
+      setJoined(true);
+      setTalking(true);
+      setSpeaking(null);
+      setStatus("In voice with the panel — just talk.");
+      log("🎙️ joined the panel — ask by voice");
+    } catch (e) {
+      log("panel join error: " + (e.message || e));
+      setStatus("Failed — see log.");
+    }
+  }
+
   async function leave() {
     try {
-      if (ws.current) {
-        ws.current.close();
-        ws.current = null;
-      }
-      if (mic.current) {
-        mic.current.stop();
-        mic.current.close();
-        mic.current = null;
-      }
-      if (client.current) {
-        await client.current.leave();
-        client.current = null;
-      }
+      await disconnectAgora();
       await fetch("/session/stop", { method: "POST" });
     } catch (e) {
       log("leave error: " + (e.message || e));
     }
     setJoined(false);
+    setTalking(false);
     setSpeaking(null);
     setThinking(false);
     setStatus("Idle.");
@@ -169,6 +200,54 @@ export default function App() {
       log("scoring error: " + (e.message || e));
     }
     setScoring(false);
+  }
+
+  async function ask() {
+    if (!askQ.trim()) return;
+    setAsking(true);
+    try {
+      const r = await fetch("/panel/ask", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ question: askQ, mode: askTarget ? "addressed" : "open", target: askTarget || null }),
+      });
+      const d = await r.json();
+      setQa((q) => [...q, { q: askQ, by: nameOf(d.answered_by), a: d.answer }]);
+      if (d.override) setOverrides((o) => [...o, d.override]); // override tool fired
+      setAskQ("");
+    } catch (e) { log("ask error: " + (e.message || e)); }
+    setAsking(false);
+  }
+
+  async function askCounterfactual() {
+    if (!cfAgent || !cfTurn || !cfHypo.trim()) return;
+    setAsking(true);
+    try {
+      const r = await fetch("/panel/counterfactual", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ turn: Number(cfTurn), hypothetical: cfHypo, agent_id: cfAgent }),
+      });
+      const d = await r.json();
+      setQa((q) => [...q, {
+        q: `Counterfactual @turn ${cfTurn} for ${nameOf(cfAgent)}: “${cfHypo}”`,
+        by: nameOf(cfAgent),
+        a: `Would move ${Math.round(d.original_overall * 100)} → ${Math.round(d.new_overall * 100)}. ${d.changes} (locked score unchanged)`,
+      }]);
+      setCfHypo("");
+    } catch (e) { log("counterfactual error: " + (e.message || e)); }
+    setAsking(false);
+  }
+
+  async function submitOverride() {
+    if (!ovDecision) return;
+    try {
+      const r = await fetch("/panel/override", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ decision: ovDecision, reason: ovReason }),
+      });
+      const d = await r.json();
+      setOverrides((o) => [...o, d]);
+      setOvReason("");
+    } catch (e) { log("override error: " + (e.message || e)); }
   }
 
   async function interrupt() {
@@ -207,8 +286,15 @@ export default function App() {
 
       {report && (
         <div className="report">
-          <div className={"rec rec-" + report.conclusion.recommendation}>
-            {report.conclusion.recommendation.replace(/_/g, " ")}
+          <div className="rec-line">
+            <span className={"rec rec-" + report.conclusion.recommendation}>
+              {report.conclusion.recommendation.replace(/_/g, " ")}
+            </span>
+            {overrides.length > 0 && (
+              <span className={"rec rec-" + overrides[overrides.length - 1].decision}>
+                → overridden: {overrides[overrides.length - 1].decision.replace(/_/g, " ")}
+              </span>
+            )}
           </div>
           <div className="headline">{report.conclusion.headline}</div>
 
@@ -271,6 +357,80 @@ export default function App() {
           </div>
 
           <div className="rep-hash">🔒 locked record · SHA-256 {report.locked_hash.slice(0, 24)}…</div>
+
+          <div className="rep-section askpanel">
+            <div className="rep-title">Ask the panel</div>
+
+            <div className="voice-join">
+              {!talking ? (
+                <button className="join" onClick={panelJoin}>🎙️ Join to talk to the panel (voice)</button>
+              ) : (
+                <span className="talking-note">
+                  🎙️ In voice with the panel — just speak.
+                  {speaking ? ` ${nameOf(speaking)} is answering…` : ""}
+                </span>
+              )}
+              <span className="voice-or">— or type —</span>
+            </div>
+
+            {qa.map((x, i) => (
+              <div className="qa" key={i}>
+                <div className="qa-q">Q: {x.q}</div>
+                <div className="qa-a"><b>{x.by}:</b> {x.a}</div>
+              </div>
+            ))}
+
+            <div className="ask-row">
+              <select value={askTarget} onChange={(e) => setAskTarget(e.target.value)}>
+                <option value="">Open (host)</option>
+                {report.scores.map((s) => (
+                  <option key={s.agent_id} value={s.agent_id}>{nameOf(s.agent_id)}</option>
+                ))}
+              </select>
+              <input
+                value={askQ}
+                placeholder="e.g. Why did you flag this candidate?"
+                onChange={(e) => setAskQ(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && ask()}
+              />
+              <button onClick={ask} disabled={asking}>{asking ? "…" : "Ask"}</button>
+            </div>
+
+            <div className="ask-sub">Counterfactual — “what if they had said…”</div>
+            <div className="ask-row">
+              <select value={cfAgent} onChange={(e) => setCfAgent(e.target.value)}>
+                <option value="">interviewer…</option>
+                {report.scores.map((s) => (
+                  <option key={s.agent_id} value={s.agent_id}>{nameOf(s.agent_id)}</option>
+                ))}
+              </select>
+              <input className="cf-turn" type="number" value={cfTurn}
+                placeholder="turn" onChange={(e) => setCfTurn(e.target.value)} />
+              <input value={cfHypo} placeholder="hypothetical answer…"
+                onChange={(e) => setCfHypo(e.target.value)} />
+              <button onClick={askCounterfactual} disabled={asking}>Re-score</button>
+            </div>
+
+            <div className="ask-sub">Override the recommendation</div>
+            <div className="ask-row">
+              <select value={ovDecision} onChange={(e) => setOvDecision(e.target.value)}>
+                <option value="">decision…</option>
+                {["PROCEED", "PROCEED_FLAGGED", "INSUFFICIENT_SIGNAL", "DECLINE"].map((d) => (
+                  <option key={d} value={d}>{d.replace(/_/g, " ")}</option>
+                ))}
+              </select>
+              <input value={ovReason} placeholder="reason (logged)"
+                onChange={(e) => setOvReason(e.target.value)} />
+              <button onClick={submitOverride}>Log override</button>
+            </div>
+            {overrides.map((o, i) => (
+              <div className="ovr" key={i}>
+                override: <b>{o.original_recommendation.replace(/_/g, " ")}</b> →{" "}
+                <b>{o.decision.replace(/_/g, " ")}</b> — {o.reason}
+                <span className="ovr-note"> (original recommendation kept)</span>
+              </div>
+            ))}
+          </div>
         </div>
       )}
 

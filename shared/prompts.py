@@ -351,3 +351,56 @@ def build_conclusion_prompt(scores_summary: str, debate_summary: str,
             f"Competency coverage:\n{coverage_summary}\n\n"
             "Write the panel's conclusion. Output ONLY the JSON.")
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+# ---- Phase 6: Ask the Panel (§7) -----------------------------------------
+
+_ASK_RULES = (
+    "\n\nThe interview is over and the scores are locked. You are {name}, speaking "
+    "to a recruiter on a call about this candidate — a spokesperson reading back a "
+    "decision already made, NOT re-judging.\n"
+    "- Answer ONLY from the record below. If something isn't in it, say so plainly; "
+    "never invent reasoning the panel didn't have.\n"
+    "- Talk like a real person out loud: natural and direct, 2-3 short sentences. "
+    "Reference specifics naturally — what the candidate said and roughly when, or "
+    "the score you gave — but NEVER quote the record's section headings or bracket "
+    "tags (don't say things like 'see the CONCLUSION entry' or 'LOCKED SCORES'). "
+    "Just say it in plain words.\n"
+    "- This is SPOKEN aloud: no markdown, no asterisks, no bullet points, no "
+    "underscores or ALL-CAPS labels — say 'proceed with flags', not "
+    "'PROCEED_FLAGGED'."
+)
+
+_COUNTERFACTUAL_RULES = (
+    "\n\nYou are re-scoring a single counterfactual. Consider ONLY how the "
+    "hypothetical answer would change YOUR competency assessment — do not re-judge "
+    "other areas or other interviewers. Be disciplined: a stronger hypothetical may "
+    "raise your score, a weaker one may lower it, or it may not change it at all.\n"
+    "Output ONLY compact JSON:\n"
+    '{{"new_overall": <0-1>, "changes": "<= 2 sentences: what moves and why>", '
+    '"would_change_recommendation": true or false}}'
+)
+
+
+def build_ask_prompt(agent_id: str, record_text: str, question: str) -> list[dict]:
+    """Grounded Q&A prompt. `agent_id` is the answering agent (an interviewer for
+    an addressed question, the Orchestrator for an open one)."""
+    agent = AGENTS[agent_id]
+    system = agent.persona + _ASK_RULES.format(name=agent.name)
+    user = (f"THE LOCKED RECORD:\n{record_text}\n\n"
+            f"Recruiter asks: {question}\n\nAnswer from the record only.")
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+def build_counterfactual_prompt(agent_id: str, record_text: str, turn: int,
+                                hypothetical: str, original_overall: float) -> list[dict]:
+    """Counterfactual re-score prompt for one interviewer (§7)."""
+    agent = AGENTS[agent_id]
+    system = agent.persona + _COUNTERFACTUAL_RULES
+    user = (f"THE LOCKED RECORD:\n{record_text}\n\n"
+            f"Counterfactual: suppose that at turn {turn}, instead of what they "
+            f"actually said, the candidate had said: \"{hypothetical}\". Everything "
+            f"else in the record stays exactly as-is. Your locked overall for this "
+            f"candidate was {original_overall:.2f}. Re-score ONLY your competencies "
+            "under that change. Output ONLY the JSON.")
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]

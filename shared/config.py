@@ -35,6 +35,11 @@ class Settings(BaseSettings):
     smart_turn_model_path: str = "models/smart-turn-v3.1.onnx"
     smart_turn_threshold: float = 0.5
 
+    # TTS: streaming (Deepgram WebSocket) for low first-audio latency (~1.3s). The
+    # socket is occasionally slow to connect; we fail fast to REST on those, so
+    # streaming stays the default and a bad moment just degrades, never stalls.
+    tts_use_streaming: bool = True
+
     # Barge-in (interrupt the agent by talking over it). Needs the candidate on
     # headphones — otherwise the agent's own voice echoes into the mic and
     # false-triggers it. Set false for robust half-duplex on speakers: the agent
