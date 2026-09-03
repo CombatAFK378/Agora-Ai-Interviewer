@@ -7,7 +7,6 @@ not written down, the answer is "I don't have that"). Counterfactuals do re-run
 one agent's scoring on a hypothetical, but they are stored separately and NEVER
 mutate the locked scores, so the hash still verifies (§7, §13.7).
 """
-import json
 import logging
 from dataclasses import dataclass, field
 
@@ -16,32 +15,6 @@ from shared.config import get_settings
 from shared.models import AskAnswer, Override, WhatIfQuery
 
 logger = logging.getLogger(__name__)
-
-# The Orchestrator's override tool (§7). It fires ONLY on a clear, explicit
-# recruiter instruction to overrule — so a recruiter can override by voice/typing
-# ("override this to decline, …") with no button. Questions never trigger it.
-_OVERRIDE_TOOL = [{
-    "type": "function",
-    "function": {
-        "name": "override_recommendation",
-        "description": (
-            "Record a recruiter override of the panel's recommendation. ONLY call "
-            "this when the recruiter gives a CLEAR, explicit instruction to override "
-            "or overrule the recommendation (e.g. 'override this to decline', "
-            "'I'm overruling this — mark it proceed'). NEVER call it for a question, "
-            "a hypothetical, or general discussion."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "decision": {"type": "string",
-                             "enum": ["PROCEED", "PROCEED_FLAGGED", "INSUFFICIENT_SIGNAL", "DECLINE"]},
-                "reason": {"type": "string", "description": "the recruiter's stated reason"},
-            },
-            "required": ["decision", "reason"],
-        },
-    },
-}]
 
 
 @dataclass
@@ -54,15 +27,32 @@ class PanelRecord:
     audit: list = field(default_factory=list)      # list[dict]
     what_ifs: list = field(default_factory=list)    # list[WhatIfQuery]
     overrides: list = field(default_factory=list)   # list[Override]
+    contexts: dict = field(default_factory=dict)    # agent id -> role/rubric grounding (§9)
+
+
+def _cap(s: str, n: int) -> str:
+    """Trim to a word boundary with an ellipsis — never mid-word."""
+    s = (s or "").strip()
+    if len(s) <= n:
+        return s
+    return s[:n].rsplit(" ", 1)[0].rstrip() + "…"
 
 
 def render_record(r: PanelRecord) -> str:
-    """Flatten the locked record into the grounding context for an answer."""
+    """Flatten the locked record into the grounding context for an answer.
+
+    Kept LEAN on purpose: this is sent on EVERY Ask-the-Panel question, so a
+    bloated context both slows generation and burns the fast model's per-minute
+    token budget (tipping answers onto slow fallback models). We keep everything
+    that grounds an answer — every score, every claim, the candidate's own words
+    in full, the conclusion — and only trim the verbose parts (long interviewer
+    questions especially; the candidate's words + the evidence ledger carry the
+    substance). Phase 8 replaces this with per-question retrieval (RAG)."""
     rep = r.report
     c = rep.conclusion
     out = [f"CONCLUSION: {c.recommendation} — {c.headline}"]
     if c.reasoning:
-        out.append(f"Reasoning: {c.reasoning}")
+        out.append(f"Reasoning: {_cap(c.reasoning, 400)}")
     if c.unresolved:
         out.append("Unresolved: " + "; ".join(
             f"{u.get('item')} [{u.get('evidence')}]" for u in c.unresolved))
@@ -72,31 +62,26 @@ def render_record(r: PanelRecord) -> str:
         a = prompts.AGENTS[s.agent_id]
         comps = ", ".join(f"{k} {v:.2f}" for k, v in s.competency_scores.items()) or "not assessed"
         out.append(f"- {a.name} ({a.title}): overall {s.overall:.2f} [{s.conviction}] — "
-                   f"{comps}. {s.rationale}")
+                   f"{comps}. {_cap(s.rationale, 180)}")
 
     out.append("\nDEBATE:")
     for d in rep.debate:
         a = prompts.AGENTS[d.agent_id]
         out.append(f"- {a.name}: {d.action}"
-                   f"{' (STRONG hold enforced)' if d.rejected else ''} — {d.statement}")
+                   f"{' (STRONG hold enforced)' if d.rejected else ''} — {_cap(d.statement, 160)}")
 
     out.append("\nEVIDENCE LEDGER:")
     for cl in r.claims:
-        out.append(f"- [{cl.id}] turn {cl.source_turn} · {cl.competency} · {cl.status} · "
-                   f"strength {cl.strength:.1f} — {cl.text}")
+        out.append(f"- turn {cl.source_turn} · {cl.competency} · {cl.status} — {_cap(cl.text, 140)}")
 
+    # Candidate turns carry the substance, so keep them fuller; interviewer
+    # questions are often long — trim them hard.
     out.append("\nTRANSCRIPT:")
     for t in r.transcript:
-        who = prompts.AGENTS[t.speaker].title if t.speaker in prompts.AGENTS else "Candidate"
+        is_cand = t.speaker not in prompts.AGENTS
+        who = "Candidate" if is_cand else prompts.AGENTS[t.speaker].title
         txt = t.text if not t.truncated else (t.text[: t.truncation_char or 0] + " …[interrupted]")
-        out.append(f"- turn {t.seq} {who}: {txt}")
-
-    grants = [a for a in r.audit if a.get("type") == "floor_grant"]
-    if grants:
-        out.append("\nFLOOR GRANTS (who was chosen to ask, and why):")
-        for a in grants:
-            d = a.get("data", {})
-            out.append(f"- {d.get('winner')} (λ={d.get('lambda')}, all_low={d.get('all_low')})")
+        out.append(f"- turn {t.seq} {who}: {_cap(txt, 320 if is_cand else 120)}")
     return "\n".join(out)
 
 
@@ -111,42 +96,28 @@ def answer(record: PanelRecord, question: str, mode: str = "open",
     model = get_settings().llm_fast_model
 
     if mode == "addressed" and target in prompts.AGENTS:
+        # The recruiter addressed someone who wasn't on this role's panel (§9 dossier
+        # dropped them) — say so plainly instead of improvising a non-existent view.
+        on_panel = {s.agent_id for s in record.report.scores}
+        if target not in on_panel:
+            who = prompts.AGENTS[target]
+            msg = (f"I wasn't on the panel for this role, so I didn't assess this "
+                   f"candidate — {who.title.lower()} wasn't a fit for what this job needs. "
+                   "Happy to point you to whoever did.")
+            return AskAnswer(question=question, mode="addressed", target=target,
+                             answered_by=target, answer=msg)
         messages = prompts.build_ask_prompt(target, render_record(record), question)
-        text = llm_router.chat(messages, model=model, max_tokens=350,
+        text = llm_router.chat(messages, model=model, max_tokens=180,
                                temperature=0.4, reasoning_effort="low")
         return AskAnswer(question=question, mode="addressed", target=target,
                          answered_by=target, answer=text)
 
-    # Open → Orchestrator, with the override tool available.
+    # Open → Orchestrator answers, grounded in the record. Overrides are handled
+    # deterministically by the caller (voice: AskPipeline; text: the override
+    # button → /panel/override), not by a fragile LLM tool-call.
     messages = prompts.build_ask_prompt("orchestrator", render_record(record), question)
-    messages[0]["content"] += (
-        "\n\nYou also have an `override_recommendation` tool. Call it ONLY when the "
-        "recruiter clearly and explicitly instructs you to override the recommendation; "
-        "for anything else, just answer.")
-    try:
-        msg = llm_router.complete_with_tools(messages, _OVERRIDE_TOOL, model=model, max_tokens=400)
-    except Exception as e:
-        logger.warning("tool completion failed (%s); plain answer", e)
-        text = llm_router.chat(messages, model=model, max_tokens=350,
-                               temperature=0.4, reasoning_effort="low")
-        return AskAnswer(question=question, mode="open", answered_by="orchestrator", answer=text)
-
-    for call in (msg.get("tool_calls") or []):
-        fn = call.get("function", {})
-        if fn.get("name") == "override_recommendation":
-            try:
-                args = json.loads(fn.get("arguments") or "{}")
-            except Exception:
-                args = {}
-            ov = override(record, str(args.get("decision", "")).upper(), str(args.get("reason", "")))
-            ans = (f"Done — I've overridden the recommendation from "
-                   f"{ov.original_recommendation.replace('_', ' ')} to "
-                   f"{ov.decision.replace('_', ' ')} and logged your reason. The panel's "
-                   "original recommendation stays on record.")
-            return AskAnswer(question=question, mode="open", answered_by="orchestrator",
-                             answer=ans, override=ov)
-
-    text = (msg.get("content") or "").strip() or "(no answer)"
+    text = llm_router.chat(messages, model=model, max_tokens=180,
+                           temperature=0.4, reasoning_effort="low")
     return AskAnswer(question=question, mode="open", answered_by="orchestrator", answer=text)
 
 
@@ -157,7 +128,8 @@ def counterfactual(record: PanelRecord, turn: int, hypothetical: str, agent_id: 
     if score is None:
         raise ValueError(f"unknown agent {agent_id!r}")
     messages = prompts.build_counterfactual_prompt(
-        agent_id, render_record(record), turn, hypothetical, score.overall)
+        agent_id, render_record(record), turn, hypothetical, score.overall,
+        record.contexts.get(agent_id, ""))
     data = scoring._parse_json(scoring.reason(messages, max_tokens=400))
     wq = WhatIfQuery(
         interview_id=record.interview_id, agent_id=agent_id, source_turn=turn,

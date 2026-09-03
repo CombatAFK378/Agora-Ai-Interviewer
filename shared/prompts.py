@@ -130,7 +130,9 @@ _INTERVIEW_RULES = (
     "honestly but kindly — it's fine to note when an answer falls short of what you'd "
     "expect at their level, or to say 'no worries, let's try another angle.' Vary how "
     "you react; never reuse a stock phrase.\n"
-    "2. Then ask ONE follow-up in YOUR area, grounded in something specific they said.\n"
+    "2. Then ask ONE follow-up in YOUR area, grounded in something specific they just "
+    "said OR a concrete project/experience on their résumé (reference it by name). "
+    "Prefer real things about this candidate over generic textbook questions.\n"
     "\nStyle:\n"
     "- Keep the whole turn to one or two short, spoken sentences — plain language, the "
     "way people actually talk. No dense, compound, multi-part questions.\n"
@@ -179,21 +181,41 @@ _DISCLOSURE = (
 _OPENER = "So, to start — what have you been working on lately?"
 
 
-def orchestrator_intro() -> str:
-    """The host's scripted opening: AI disclosure + introduce the five by name."""
+def orchestrator_intro(panel: list[str] | None = None, dossier=None) -> str:
+    """The host's scripted opening: greet the candidate, AI disclosure, name the
+    role we're hiring for, and introduce the panel.
+
+    `panel` is the dossier-selected subset (§9); `dossier` personalises the greeting
+    (candidate name) and states the role/focus. Both optional.
+    """
+    ids = [a for a in (panel or PANEL_IDS) if a in AGENTS] or list(PANEL_IDS)
     names = ", ".join(
         f"{AGENTS[a].name} on {AGENTS[a].title.lower().replace(' interviewer','').replace(' advocate','')}"
-        for a in PANEL_IDS
+        for a in ids
     )
+    name = getattr(dossier, "candidate_name", "") or ""
+    greeting = f"Hi {name}, and welcome." if name else "Hello, and welcome."
+    role_line = ""
+    if dossier is not None and getattr(dossier, "role", ""):
+        role_line = f" We're speaking with you today about the {dossier.role} role."
+        focus = getattr(dossier, "focus", None) or []
+        if focus:
+            role_line += f" We're especially keen to dig into {', '.join(focus[:3])}."
     return (
-        f"{_DISCLOSURE} On the panel today: {names}. "
-        f"{AGENTS[OPENING_AGENT_ID].name} will get us started."
+        f"{greeting} Before we begin: I'm an AI host, and everyone on this panel is an "
+        f"AI interviewer. This session is recorded and transcribed.{role_line} "
+        f"On the panel today: {names}. {AGENTS[OPENING_AGENT_ID].name} will get us started."
     )
 
 
-def opening_line(agent_id: str) -> str:
-    """The scripted first interviewer turn — a broad, low-stakes opener (§5)."""
+def opening_line(agent_id: str, dossier=None) -> str:
+    """The scripted first interviewer turn — a warm, name-personalised opener that
+    invites the candidate to walk through their most relevant experience (§5)."""
     _ = AGENTS[agent_id]
+    name = getattr(dossier, "candidate_name", "") or ""
+    if name:
+        return (f"Thanks for joining, {name}. To get us going — walk me through a "
+                "project or piece of work on your résumé you're most proud of.")
     return _OPENER
 
 
@@ -216,16 +238,18 @@ def _render_transcript(agent_id: str, transcript: list[TranscriptTurn]) -> list[
 
 
 def build_agent_prompt(
-    agent_id: str, phase: str, transcript: list[TranscriptTurn], extra: str = ""
+    agent_id: str, phase: str, transcript: list[TranscriptTurn], extra: str = "", context: str = ""
 ) -> list[dict]:
     """Construct the question-generation prompt for `agent_id` (the floor winner).
 
-    `extra` appends a transient instruction (e.g. rephrase after a clarification).
+    `context` injects role/rubric grounding from the dossier (§9); `extra` appends
+    a transient instruction (e.g. rephrase after a clarification).
     """
     if phase != "LIVE":
         raise NotImplementedError(f"prompt phase {phase!r} lands in a later build phase")
     agent = AGENTS[agent_id]
-    system = agent.persona + _INTERVIEW_RULES + (f"\n\n{extra}" if extra else "")
+    system = (agent.persona + (f"\n\n{context}" if context else "")
+              + _INTERVIEW_RULES + (f"\n\n{extra}" if extra else ""))
     return [{"role": "system", "content": system}] + _render_transcript(agent_id, transcript)
 
 
@@ -243,7 +267,7 @@ def _agent_competencies(agent_id: str) -> list[str]:
     return [c.key for c in DEFAULT_COMPETENCIES if agent_id in c.owners]
 
 
-def build_bid_prompt(agent_id: str, transcript: list[TranscriptTurn]) -> list[dict]:
+def build_bid_prompt(agent_id: str, transcript: list[TranscriptTurn], context: str = "") -> list[dict]:
     """Construct the bid prompt for `agent_id` — returns JSON with the bid AND any
     claims noticed in the candidate's latest answer (ARCHITECTURE §4).
 
@@ -253,7 +277,8 @@ def build_bid_prompt(agent_id: str, transcript: list[TranscriptTurn]) -> list[di
     """
     agent = AGENTS[agent_id]
     comps = ", ".join(_agent_competencies(agent_id)) or "general"
-    system = agent.persona + _BID_RULES.format(focus=agent.focus or agent.title, comps=comps)
+    system = (agent.persona + (f"\n\n{context}" if context else "")
+              + _BID_RULES.format(focus=agent.focus or agent.title, comps=comps))
     convo = _flatten_transcript(transcript) or "(nothing said yet)"
     user = f"Conversation so far:\n\n{convo}\n\nNow output ONLY your JSON."
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
@@ -310,7 +335,8 @@ _CONCLUSION_RULES = (
 )
 
 
-def build_scoring_prompt(agent_id: str, transcript: list[TranscriptTurn], claims: list) -> list[dict]:
+def build_scoring_prompt(agent_id: str, transcript: list[TranscriptTurn], claims: list,
+                         context: str = "") -> list[dict]:
     """Blind scoring prompt (§6): full transcript + the ledger evidence in this
     agent's area. Each agent scores independently, on its own competencies."""
     agent = AGENTS[agent_id]
@@ -321,7 +347,8 @@ def build_scoring_prompt(agent_id: str, transcript: list[TranscriptTurn], claims
         for c in claims if c.competency in my_comps
     ]
     evidence = "\n".join(ev_lines) or "(no claims recorded in your area)"
-    system = agent.persona + _SCORING_RULES.format(comps=", ".join(my_comps) or "general")
+    system = (agent.persona + (f"\n\n{context}" if context else "")
+              + _SCORING_RULES.format(comps=", ".join(my_comps) or "general"))
     user = (f"Full interview transcript:\n\n{convo}\n\n"
             f"Evidence from the ledger in your area:\n{evidence}\n\n"
             "Score now. Output ONLY the JSON.")
@@ -361,11 +388,13 @@ _ASK_RULES = (
     "decision already made, NOT re-judging.\n"
     "- Answer ONLY from the record below. If something isn't in it, say so plainly; "
     "never invent reasoning the panel didn't have.\n"
-    "- Talk like a real person out loud: natural and direct, 2-3 short sentences. "
-    "Reference specifics naturally — what the candidate said and roughly when, or "
-    "the score you gave — but NEVER quote the record's section headings or bracket "
-    "tags (don't say things like 'see the CONCLUSION entry' or 'LOCKED SCORES'). "
-    "Just say it in plain words.\n"
+    "- This is a LIVE call — keep it SHORT: one to two sentences, then stop. The "
+    "recruiter will ask a follow-up if they want more; don't pre-empt it with a "
+    "monologue. Get to the point in the first sentence.\n"
+    "- Talk like a real person out loud: natural and direct. Reference specifics "
+    "naturally — what the candidate said, or the score you gave — but NEVER quote the "
+    "record's section headings or bracket tags (don't say things like 'see the "
+    "CONCLUSION entry' or 'LOCKED SCORES'). Just say it in plain words.\n"
     "- This is SPOKEN aloud: no markdown, no asterisks, no bullet points, no "
     "underscores or ALL-CAPS labels — say 'proceed with flags', not "
     "'PROCEED_FLAGGED'."
@@ -393,10 +422,11 @@ def build_ask_prompt(agent_id: str, record_text: str, question: str) -> list[dic
 
 
 def build_counterfactual_prompt(agent_id: str, record_text: str, turn: int,
-                                hypothetical: str, original_overall: float) -> list[dict]:
+                                hypothetical: str, original_overall: float,
+                                context: str = "") -> list[dict]:
     """Counterfactual re-score prompt for one interviewer (§7)."""
     agent = AGENTS[agent_id]
-    system = agent.persona + _COUNTERFACTUAL_RULES
+    system = agent.persona + (f"\n\n{context}" if context else "") + _COUNTERFACTUAL_RULES
     user = (f"THE LOCKED RECORD:\n{record_text}\n\n"
             f"Counterfactual: suppose that at turn {turn}, instead of what they "
             f"actually said, the candidate had said: \"{hypothetical}\". Everything "

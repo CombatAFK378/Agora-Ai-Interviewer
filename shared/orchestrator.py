@@ -171,20 +171,23 @@ class FloorController:
 
 # --- parallel bid collection --------------------------------------------
 
-def collect_bids(panel_ids: list[str], transcript: list[TranscriptTurn]) -> dict[str, Bid]:
+def collect_bids(panel_ids: list[str], transcript: list[TranscriptTurn],
+                 contexts: dict[str, str] | None = None) -> dict[str, Bid]:
     """Fan out one bid call per interviewer, in parallel (ARCHITECTURE §4).
 
-    Only the most recent turns are sent to each bid (token hot path); the caller
-    keeps the full transcript for scoring/dashboard.
+    `contexts` carries per-agent role/rubric grounding from the dossier. Only the
+    most recent turns are sent to each bid (token hot path); the caller keeps the
+    full transcript for scoring/dashboard.
     """
     recent = transcript[-BID_CONTEXT_TURNS:]
+    ctx = contexts or {}
     with ThreadPoolExecutor(max_workers=len(panel_ids)) as ex:
-        results = ex.map(lambda a: _one_bid(a, recent), panel_ids)
+        results = ex.map(lambda a: _one_bid(a, recent, ctx.get(a, "")), panel_ids)
     return {b.agent_id: b for b in results}
 
 
-def _one_bid(agent_id: str, transcript: list[TranscriptTurn]) -> Bid:
-    messages = prompts.build_bid_prompt(agent_id, transcript)
+def _one_bid(agent_id: str, transcript: list[TranscriptTurn], context: str = "") -> Bid:
+    messages = prompts.build_bid_prompt(agent_id, transcript, context)
     for attempt in range(2):   # malformed JSON → retry once, then default (§10)
         try:
             # gpt-oss spends completion tokens on reasoning before the JSON; the

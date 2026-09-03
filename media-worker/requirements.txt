@@ -3,9 +3,13 @@ fastapi
 uvicorn[standard]
 pydantic
 pydantic-settings
+# multipart/form-data parsing for PDF uploads (JD + résumé, Phase 7)
+python-multipart
 
 # HTTP to Sarvam / Deepgram
 requests
+# JD + résumé PDF text extraction (Phase 7 dossier); pure-Python, no native deps
+pypdf
 # WebSocket client for Deepgram streaming TTS (low time-to-first-audio)
 websocket-client
 

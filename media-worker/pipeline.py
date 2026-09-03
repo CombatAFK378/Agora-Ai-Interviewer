@@ -35,11 +35,12 @@ from vad import SileroVAD
 import stt
 import tts
 
+from shared import dossier as dossier_mod
 from shared import llm_router, orchestrator, prompts
-from shared.competencies import DEFAULT_COMPETENCIES
+from shared.competencies import DEFAULT_COMPETENCIES, Competency
 from shared.config import Settings
 from shared.ledger import Ledger
-from shared.models import AuditEvent, TranscriptTurn
+from shared.models import AuditEvent, Dossier, TranscriptTurn
 
 logger = logging.getLogger(__name__)
 
@@ -57,24 +58,42 @@ QUESTION_CONTEXT_TURNS = 16
 
 
 class InterviewPipeline:
-    def __init__(self, session: AgoraSession, settings: Settings, interview_id: str):
+    def __init__(self, session: AgoraSession, settings: Settings, interview_id: str,
+                 dossier: Dossier | None = None):
         self.session = session
         self.settings = settings
         self.interview_id = interview_id
         self.sample_rate = settings.audio_sample_rate
         self.allow_bargein = settings.allow_bargein
 
-        self.panel = prompts.PANEL_IDS
+        # Dossier (§9): panel composition, competency weights, per-agent rubrics,
+        # and résumé claims. Falls back to the full panel / defaults if absent.
+        self.dossier = dossier
+        self.panel = list(dossier.panel) if (dossier and dossier.panel) else list(prompts.PANEL_IDS)
+        self._competencies = _derive_competencies(dossier, self.panel)
+        # Lean context (role + focus + rubric) for the token-hot paths (bids, scoring);
+        # rich context (adds the candidate's résumé highlights) for question generation.
+        self.contexts = {a: (dossier_mod.role_context(dossier, a) if dossier else "")
+                         for a in self.panel}
+        self.q_contexts = {a: (dossier_mod.question_context(dossier, a) if dossier else "")
+                           for a in self.panel}
+
         self.floor = orchestrator.FloorController(
             panel_ids=self.panel,
-            competencies=DEFAULT_COMPETENCIES,
+            competencies=self._competencies,
             time_budget_s=settings.interview_time_budget_s,
             lambda_start=settings.coverage_lambda_start,
             lambda_end=settings.coverage_lambda_end,
         )
         # The evidence ledger: claims extracted inside bids, competency coverage.
-        self.ledger = Ledger(interview_id, DEFAULT_COMPETENCIES)
-        self._competencies = DEFAULT_COMPETENCIES
+        self.ledger = Ledger(interview_id, self._competencies)
+        # Pre-register résumé claims as UNVERIFIED evidence (§9) — verified or
+        # contradicted as the candidate speaks.
+        if dossier:
+            for rc in dossier.resume_claims:
+                self.ledger.add(text=rc.get("text", ""), competency=rc.get("competency", ""),
+                                source_turn=0, strength=0.4, status="UNVERIFIED",
+                                noticed_by="resume")
 
         self.vad = SileroVAD(
             sample_rate=self.sample_rate,
@@ -132,10 +151,11 @@ class InterviewPipeline:
             pass
 
     def report_inputs(self):
-        """Snapshot the full record for scoring: (transcript, claims, coverage, panel)."""
+        """Snapshot the full record for scoring: (transcript, claims, coverage, panel, contexts)."""
         with self._tx_lock:
             transcript = [t.model_copy() for t in self.transcript]
-        return transcript, self.ledger.claims(), self.ledger.coverage(), list(self.panel)
+        return (transcript, self.ledger.claims(), self.ledger.coverage(),
+                list(self.panel), dict(self.contexts))
 
     def request_interrupt(self) -> bool:
         """Manual barge-in from the candidate's Interrupt button."""
@@ -240,10 +260,10 @@ class InterviewPipeline:
     def _cold_open(self):
         time.sleep(OPENER_DELAY_SECS)
         logger.info("cold start: host intro + opener")
-        self._speak_and_wait("orchestrator", prompts.orchestrator_intro())
+        self._speak_and_wait("orchestrator", prompts.orchestrator_intro(self.panel, self.dossier))
         if self._stop.is_set():
             return
-        opener = prompts.opening_line(prompts.OPENING_AGENT_ID)
+        opener = prompts.opening_line(prompts.OPENING_AGENT_ID, self.dossier)
         self._speak_and_wait(prompts.OPENING_AGENT_ID, opener)
         self.floor.record(prompts.OPENING_AGENT_ID)
 
@@ -268,7 +288,7 @@ class InterviewPipeline:
             return
 
         self._emit({"type": "thinking"})
-        bids = orchestrator.collect_bids(self.panel, snapshot)
+        bids = orchestrator.collect_bids(self.panel, snapshot, self.contexts)
 
         # Steps 5 and 10 are the same call (§4): the bids also carry the claims
         # each interviewer noticed. Write them to the ledger, then refresh the
@@ -308,7 +328,8 @@ class InterviewPipeline:
 
     def _generate_question(self, agent_id: str, extra: str = "") -> str:
         transcript = self._snapshot_transcript()[-QUESTION_CONTEXT_TURNS:]
-        messages = prompts.build_agent_prompt(agent_id, "LIVE", transcript, extra)
+        messages = prompts.build_agent_prompt(agent_id, "LIVE", transcript, extra,
+                                              self.q_contexts.get(agent_id, ""))
         try:
             return llm_router.chat(
                 messages, model=self.settings.llm_fast_model,
@@ -475,3 +496,16 @@ def _rms(pcm_bytes: bytes) -> float:
         return 0.0
     samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32)
     return float(np.sqrt(np.mean(samples * samples)))
+
+
+def _derive_competencies(dossier: Optional[Dossier], panel: list[str]) -> list[Competency]:
+    """Per-interview competency set (§9): keep the defaults owned by someone on the
+    panel, and override their weight from the dossier where the JD specified one."""
+    comps = [c for c in DEFAULT_COMPETENCIES if any(o in panel for o in c.owners)]
+    if dossier and dossier.competency_weights:
+        comps = [
+            Competency(c.key, c.name, dossier.competency_weights.get(c.key, c.weight),
+                       c.target_evidence, c.owners)
+            for c in comps
+        ]
+    return comps or list(DEFAULT_COMPETENCIES)

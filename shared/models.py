@@ -15,6 +15,22 @@ class SessionStartResponse(BaseModel):
     channel: str         # channel both candidate and bot join
     uid: int             # numeric uid assigned to the candidate (browser)
     token: str           # candidate's join token, scoped to (channel, uid)
+    panel: list[str] = Field(default_factory=list)  # active interviewer ids (§9 dossier)
+
+
+class Dossier(BaseModel):
+    """Parsed JD + résumé for one interview (ARCHITECTURE §9). Drives which
+    interviewers sit on the panel, competency weights, per-agent rubrics, and the
+    résumé claims pre-registered into the ledger as UNVERIFIED."""
+    role: str = "Software Engineer"
+    seniority: str = "mid"                              # junior|mid|senior|staff
+    candidate_name: str = ""                            # first name, for greeting (§9)
+    summary: str = ""                                  # one-line role+candidate gist
+    focus: list[str] = Field(default_factory=list)     # key things the JD calls for
+    panel: list[str] = Field(default_factory=list)     # agent ids; empty → all five
+    competency_weights: dict[str, float] = Field(default_factory=dict)  # key -> 0..1
+    rubrics: dict[str, str] = Field(default_factory=dict)   # agent_id -> "strong means…"
+    resume_claims: list[dict] = Field(default_factory=list)  # [{text, competency}]
 
 
 class TranscriptTurn(BaseModel):

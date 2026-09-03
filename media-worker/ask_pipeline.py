@@ -26,8 +26,46 @@ from pipeline import (MIN_SPEECH_RMS, PENDING_MAX_SECS, PENDING_TIMEOUT_SECS,
                       _is_filler, _rms)
 from shared import ask_panel, prompts
 from shared.config import Settings
+from shared.models import REC_DECLINE, REC_PROCEED, REC_PROCEED_FLAGGED
 
 logger = logging.getLogger(__name__)
+
+# Deterministic voice-override detection (§7). Overriding the panel's
+# recommendation is too important to depend on an LLM tool-call (which can 400 or
+# fall back to a plain answer that can't override) — so we catch clear spoken
+# commands in code and apply them directly.
+_OVERRIDE_TRIGGERS = ("override", "overrule", "overwrite")
+_ACCEPT_PHRASES = (
+    "accept the candidate", "accept this candidate", "accept him", "accept her",
+    "select the candidate", "select this candidate", "select him", "select her",
+    "hire him", "hire her", "hire the candidate", "hire this candidate",
+    "proceed with the candidate", "proceed with this", "move forward with",
+    "go ahead with", "approve the candidate", "approve this candidate",
+)
+_REJECT_PHRASES = (
+    "reject the candidate", "reject this candidate", "reject him", "reject her",
+    "decline the candidate", "decline this candidate", "do not hire", "don't hire",
+    "pass on the candidate", "pass on this candidate", "drop the candidate",
+)
+_ACCEPT_WORDS = ("accept", "select", "hire", "proceed", "approve", "go ahead", "move forward")
+_REJECT_WORDS = ("reject", "decline", "pass", "drop")
+_FLAG_WORDS = ("with flags", "with a flag", "flagged", "with caution")
+
+
+def _detect_override(text: str):
+    """Return (decision, reason) if the recruiter clearly commanded an override,
+    else None. A bare 'override' with no direction returns None so the panel can
+    ask which way to go."""
+    t = text.lower()
+    trig = any(w in t for w in _OVERRIDE_TRIGGERS)
+    accept = any(p in t for p in _ACCEPT_PHRASES) or (trig and any(w in t for w in _ACCEPT_WORDS))
+    reject = any(p in t for p in _REJECT_PHRASES) or (trig and any(w in t for w in _REJECT_WORDS))
+    if reject and not accept:
+        return REC_DECLINE, text[:500]
+    if accept and not reject:
+        dec = REC_PROCEED_FLAGGED if any(f in t for f in _FLAG_WORDS) else REC_PROCEED
+        return dec, text[:500]
+    return None
 
 GREETING_DELAY_SECS = 1.2
 # The panel must deliver at least this much before the recruiter can barge in
@@ -210,6 +248,20 @@ class AskPipeline:
     def _answer(self, text: str):
         try:
             self._emit({"type": "thinking"})
+            # Deterministic override (§7): a clear spoken command applies immediately,
+            # never dropped to a flaky LLM tool-call.
+            ov_intent = _detect_override(text)
+            if ov_intent is not None:
+                decision, reason = ov_intent
+                ov = ask_panel.override(self.record, decision, reason)
+                self._emit({"type": "override", "override": ov.model_dump()})
+                orig = ov.original_recommendation.replace("_", " ").lower()
+                new = ov.decision.replace("_", " ").lower()
+                self._speak("orchestrator",
+                            f"Done. I've overridden the panel's recommendation from "
+                            f"{orig} to {new}, and logged that you asked for it. The "
+                            "panel's original call stays on record.")
+                return
             target = self._resolve_target(text)
             if target:
                 ans = ask_panel.answer(self.record, text, mode="addressed", target=target)

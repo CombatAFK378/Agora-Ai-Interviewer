@@ -37,6 +37,15 @@ export default function App() {
   const [ovReason, setOvReason] = useState("");
   const [overrides, setOverrides] = useState([]);
   const [logLines, setLogLines] = useState([]);
+  // Phase 7 — dossier: JD + résumé grounding.
+  const [jd, setJd] = useState("");
+  const [resume, setResume] = useState("");
+  const [jdMeta, setJdMeta] = useState(null); // {filename, pages}
+  const [resumeMeta, setResumeMeta] = useState(null);
+  const [uploading, setUploading] = useState(null); // "jd" | "resume" | null
+  const [dossier, setDossier] = useState(null); // parsed preview
+  const [parsing, setParsing] = useState(false);
+  const [activePanel, setActivePanel] = useState([]); // dossier-selected interviewer ids
   const logRef = useRef(null);
 
   const client = useRef(null);
@@ -133,13 +142,70 @@ export default function App() {
     if (client.current) { try { await client.current.leave(); } catch (_) {} client.current = null; }
   }
 
+  async function uploadPdf(which, fileEl) {
+    const f = fileEl.files && fileEl.files[0];
+    if (!f) return;
+    setUploading(which);
+    setStatus(`Reading ${f.name}…`);
+    try {
+      const form = new FormData();
+      form.append("file", f);
+      const resp = await fetch("/parse-pdf", { method: "POST", body: form });
+      if (!resp.ok) throw new Error(`${resp.status} ${await resp.text()}`);
+      const d = await resp.json();
+      const meta = { filename: d.filename, pages: d.pages };
+      if (which === "jd") {
+        setJd(d.text);
+        setJdMeta(meta);
+      } else {
+        setResume(d.text);
+        setResumeMeta(meta);
+      }
+      setDossier(null); // stale once inputs change
+      setStatus(`${d.filename} — ${d.pages} page${d.pages === 1 ? "" : "s"} read.`);
+    } catch (e) {
+      log("ERROR: " + (e.message || e));
+      setStatus("PDF upload failed — see log.");
+    } finally {
+      setUploading(null);
+      fileEl.value = ""; // allow re-selecting the same file
+    }
+  }
+
+  async function previewDossier() {
+    if (!jd.trim() && !resume.trim()) return;
+    setParsing(true);
+    setStatus("Reading JD + résumé…");
+    try {
+      const resp = await fetch("/session/dossier", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ jd, resume }),
+      });
+      if (!resp.ok) throw new Error(`${resp.status} ${await resp.text()}`);
+      const d = await resp.json();
+      setDossier(d);
+      setStatus(`Dossier ready — ${d.seniority} ${d.role}, ${d.panel.length} on the panel.`);
+    } catch (e) {
+      log("ERROR: " + (e.message || e));
+      setStatus("Couldn't parse — see log.");
+    } finally {
+      setParsing(false);
+    }
+  }
+
   async function join() {
     setStatus("Starting session…");
     try {
-      const resp = await fetch("/session/start", { method: "POST" });
+      const resp = await fetch("/session/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ jd, resume }),
+      });
       if (!resp.ok) throw new Error(`${resp.status} ${await resp.text()}`);
       const s = await resp.json();
-      log(`channel=${s.channel} uid=${s.uid}`);
+      setActivePanel(s.panel || []);
+      log(`channel=${s.channel} uid=${s.uid} panel=${(s.panel || []).join(",")}`);
       setStatus("Joining channel…");
       await connectAgora(s);
       setJoined(true);
@@ -267,6 +333,132 @@ export default function App() {
         Five AI interviewers. Whoever's speaking lights up. Answer with your mic; use Interrupt to
         cut in.
       </p>
+
+      {!joined && !report && (
+        <div className="setup">
+          <div className="setup-head">
+            <strong>Interview dossier</strong>
+            <span className="setup-sub">
+              Upload the job description and the candidate's résumé as PDFs (or paste the text) —
+              the panel, competency weights, and questions adapt to the role. Optional; leave
+              blank for a generic panel.
+            </span>
+          </div>
+          <div className="setup-cols">
+            <div className="setup-col">
+              <label className="filebtn">
+                <input
+                  type="file"
+                  accept="application/pdf,.pdf"
+                  onChange={(e) => uploadPdf("jd", e.target)}
+                  disabled={joined || uploading === "jd"}
+                />
+                {uploading === "jd"
+                  ? "Reading…"
+                  : jdMeta
+                  ? `📄 ${jdMeta.filename} (${jdMeta.pages}p)`
+                  : "📎 Upload JD PDF"}
+              </label>
+              <textarea
+                className="setup-ta"
+                placeholder="…or paste the job description here"
+                value={jd}
+                onChange={(e) => {
+                  setJd(e.target.value);
+                  setJdMeta(null);
+                }}
+                disabled={joined}
+              />
+            </div>
+            <div className="setup-col">
+              <label className="filebtn">
+                <input
+                  type="file"
+                  accept="application/pdf,.pdf"
+                  onChange={(e) => uploadPdf("resume", e.target)}
+                  disabled={joined || uploading === "resume"}
+                />
+                {uploading === "resume"
+                  ? "Reading…"
+                  : resumeMeta
+                  ? `📄 ${resumeMeta.filename} (${resumeMeta.pages}p)`
+                  : "📎 Upload résumé PDF"}
+              </label>
+              <textarea
+                className="setup-ta"
+                placeholder="…or paste the candidate résumé here"
+                value={resume}
+                onChange={(e) => {
+                  setResume(e.target.value);
+                  setResumeMeta(null);
+                }}
+                disabled={joined}
+              />
+            </div>
+          </div>
+          <div className="setup-actions">
+            <button
+              onClick={previewDossier}
+              disabled={parsing || (!jd.trim() && !resume.trim())}
+            >
+              {parsing ? "Reading…" : "Preview dossier"}
+            </button>
+          </div>
+          {dossier && (
+            <div className="dossier">
+              <div className="dossier-role">
+                {dossier.seniority} {dossier.role}
+                {dossier.candidate_name && (
+                  <span className="dossier-sum"> · candidate: {dossier.candidate_name}</span>
+                )}
+                {dossier.summary && <span className="dossier-sum"> — {dossier.summary}</span>}
+              </div>
+              {(dossier.focus || []).length > 0 && (
+                <div className="dossier-focus">
+                  <span className="dossier-label">Role focus:</span>{" "}
+                  {dossier.focus.map((f, i) => (
+                    <span className="pill" key={i}>
+                      {f}
+                    </span>
+                  ))}
+                </div>
+              )}
+              <div className="dossier-panel">
+                <span className="dossier-label">Panel:</span>{" "}
+                {dossier.panel.map((a) => (
+                  <span className="pill" key={a}>
+                    {(agents.find((g) => g.id === a) || {}).name || a}
+                  </span>
+                ))}
+              </div>
+              {Object.keys(dossier.competency_weights || {}).length > 0 && (
+                <div className="dossier-weights">
+                  <span className="dossier-label">Weights:</span>{" "}
+                  {Object.entries(dossier.competency_weights).map(([k, v]) => (
+                    <span className="pill pill-w" key={k}>
+                      {k} {Math.round(v * 100)}%
+                    </span>
+                  ))}
+                </div>
+              )}
+              {(dossier.resume_claims || []).length > 0 && (
+                <div className="dossier-claims">
+                  <span className="dossier-label">
+                    Résumé claims to verify ({dossier.resume_claims.length}):
+                  </span>
+                  <ul>
+                    {dossier.resume_claims.slice(0, 8).map((c, i) => (
+                      <li key={i}>
+                        {c.text} <em>({c.competency})</em>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
 
       <div className="controls">
         <button className="join" onClick={join} disabled={joined}>
@@ -441,19 +633,27 @@ export default function App() {
       </div>
 
       <div className="tiles">
-        {agents.map((a, i) => (
-          <div
-            key={a.id}
-            className={"tile" + (speaking === a.id ? " speaking" : thinking ? " thinking" : "")}
-          >
-            <span className="badge">SPEAKING</span>
-            <div className="avatar" style={{ background: AVATAR_COLORS[i % AVATAR_COLORS.length] }}>
-              {initials(a.name)}
+        {agents.map((a, i) => {
+          const offPanel = activePanel.length > 0 && !activePanel.includes(a.id);
+          return (
+            <div
+              key={a.id}
+              className={
+                "tile" +
+                (offPanel ? " off-panel" : "") +
+                (!offPanel && speaking === a.id ? " speaking" : !offPanel && thinking ? " thinking" : "")
+              }
+            >
+              <span className="badge">SPEAKING</span>
+              {offPanel && <span className="offbadge">not on this panel</span>}
+              <div className="avatar" style={{ background: AVATAR_COLORS[i % AVATAR_COLORS.length] }}>
+                {initials(a.name)}
+              </div>
+              <div className="name">{a.name}</div>
+              <div className="role">{a.title}</div>
             </div>
-            <div className="name">{a.name}</div>
-            <div className="role">{a.title}</div>
-          </div>
-        ))}
+          );
+        })}
       </div>
       <div className="thinkingbar">{thinking ? "the panel is deciding who asks next…" : ""}</div>
 

@@ -69,9 +69,10 @@ def compute_conviction(overall: float, evidence_count: int) -> str:
     return CONVICTION_NEUTRAL
 
 
-def score_agent(agent_id: str, transcript: list, claims: list, interview_id: str) -> AgentScore:
+def score_agent(agent_id: str, transcript: list, claims: list, interview_id: str,
+                context: str = "") -> AgentScore:
     my_comps = set(prompts._agent_competencies(agent_id))
-    raw = reason(prompts.build_scoring_prompt(agent_id, transcript, claims), max_tokens=700)
+    raw = reason(prompts.build_scoring_prompt(agent_id, transcript, claims, context), max_tokens=700)
     data = _parse_json(raw)
     comp = {str(k): _clamp(v) for k, v in (data.get("competency_scores") or {}).items()}
     overall = _clamp(data.get("overall", (sum(comp.values()) / len(comp)) if comp else 0.5))
@@ -87,10 +88,13 @@ def score_agent(agent_id: str, transcript: list, claims: list, interview_id: str
     )
 
 
-def lock(panel: list[str], transcript: list, claims: list, interview_id: str) -> list[AgentScore]:
-    """Five independent scoring passes (isolated contexts), run in parallel."""
+def lock(panel: list[str], transcript: list, claims: list, interview_id: str,
+         contexts: dict | None = None) -> list[AgentScore]:
+    """Independent scoring passes (isolated contexts), run in parallel."""
+    ctx = contexts or {}
     with ThreadPoolExecutor(max_workers=len(panel)) as ex:
-        return list(ex.map(lambda a: score_agent(a, transcript, claims, interview_id), panel))
+        return list(ex.map(
+            lambda a: score_agent(a, transcript, claims, interview_id, ctx.get(a, "")), panel))
 
 
 def canonical_hash(transcript: list, claims: list, scores: list[AgentScore]) -> str:
@@ -215,11 +219,11 @@ def conclude(interview_id: str, scores: list[AgentScore],
 
 
 def build_report(interview_id: str, panel: list[str], transcript: list,
-                 claims: list, coverage: dict) -> InterviewReport:
+                 claims: list, coverage: dict, contexts: dict | None = None) -> InterviewReport:
     """The full final-bell pipeline: lock → hash → debate → conclusion (§6)."""
     logger.info("scoring: locking %d interviewers over %d turns / %d claims",
                 len(panel), len(transcript), len(claims))
-    scores = lock(panel, transcript, claims, interview_id)
+    scores = lock(panel, transcript, claims, interview_id, contexts)
     locked_hash = canonical_hash(transcript, claims, scores)
     statements = run_debate(scores, interview_id)
     conclusion = conclude(interview_id, scores, statements, coverage, claims)

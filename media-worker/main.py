@@ -13,18 +13,19 @@ One interview per process still. Phase 3 makes it a five-agent panel and streams
 speaker signals to the UI over a WebSocket (our stand-in for Agora RTM).
 """
 import asyncio
+import io
 import logging
 import os
 import uuid
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from shared.config import get_settings
 from shared.agora_token import build_rtc_token
-from shared.models import AskAnswer, InterviewReport, Override, SessionStartResponse, WhatIfQuery
-from shared import ask_panel, prompts, scoring
+from shared.models import AskAnswer, Dossier, InterviewReport, Override, SessionStartResponse, WhatIfQuery
+from shared import ask_panel, dossier as dossier_mod, prompts, scoring
 
 from agora_session import AgoraSession
 from pipeline import InterviewPipeline
@@ -46,6 +47,17 @@ _pipeline: InterviewPipeline | None = None
 _ask_pipeline: AskPipeline | None = None   # voice Ask the Panel (Phase 6)
 _report: InterviewReport | None = None   # last locked report (Phase 5)
 _panel_record: ask_panel.PanelRecord | None = None   # for Ask the Panel (Phase 6)
+_dossier: Dossier | None = None          # active interview's dossier (Phase 7)
+
+
+class StartRequest(BaseModel):
+    jd: str = ""                  # job description (§9); empty → generic all-panel
+    resume: str = ""             # candidate résumé (§9)
+
+
+class DossierRequest(BaseModel):
+    jd: str = ""
+    resume: str = ""
 
 
 class AskRequest(BaseModel):
@@ -144,10 +156,45 @@ def health():
     return {"status": "ok", "session_active": _session is not None}
 
 
+MAX_PDF_BYTES = 10 * 1024 * 1024   # 10 MB — a JD/résumé is never bigger
+
+
+@app.post("/parse-pdf")
+async def parse_pdf(file: UploadFile = File(...)):
+    """Extract plain text from an uploaded JD or résumé PDF (§9). Text is returned
+    to the client so it can be reviewed/edited, then sent back with the dossier."""
+    from pypdf import PdfReader
+    name = (file.filename or "").lower()
+    if not name.endswith(".pdf") and (file.content_type or "") != "application/pdf":
+        raise HTTPException(400, "please upload a PDF file")
+    data = await file.read()
+    if len(data) > MAX_PDF_BYTES:
+        raise HTTPException(413, "PDF too large (max 10 MB)")
+    try:
+        reader = PdfReader(io.BytesIO(data))
+        text = "\n".join((page.extract_text() or "") for page in reader.pages).strip()
+    except Exception as e:
+        logger.warning("PDF parse failed: %s", e)
+        raise HTTPException(400, "couldn't read that PDF — is it a scanned image?")
+    if not text:
+        raise HTTPException(422, "no selectable text found (scanned/image-only PDF)")
+    return {"filename": file.filename, "pages": len(reader.pages), "text": text}
+
+
+@app.post("/session/dossier", response_model=Dossier)
+def session_dossier(req: DossierRequest):
+    """Preview the parsed dossier (§9) before starting — panel, weights, rubrics,
+    résumé claims — so the recruiter can review the panel the JD/résumé produced."""
+    if not (req.jd.strip() or req.resume.strip()):
+        raise HTTPException(400, "provide a JD and/or résumé to parse")
+    return dossier_mod.build_dossier(req.jd, req.resume)
+
+
 @app.post("/session/start", response_model=SessionStartResponse)
-def session_start():
-    global _session, _pipeline, _report, _panel_record
+def session_start(req: StartRequest | None = None):
+    global _session, _pipeline, _report, _panel_record, _dossier
     settings = get_settings()
+    req = req or StartRequest()
 
     missing = [
         name
@@ -167,6 +214,13 @@ def session_start():
     _teardown()
     _report = None
     _panel_record = None
+
+    # Parse JD + résumé into the dossier once (§9): panel, weights, rubrics,
+    # résumé claims. Empty inputs → generic all-panel interview.
+    _dossier = None
+    if req.jd.strip() or req.resume.strip():
+        _dossier = dossier_mod.build_dossier(req.jd, req.resume)
+        logger.info("dossier: role=%r panel=%s", _dossier.role, _dossier.panel)
 
     interview_id = uuid.uuid4().hex[:12]
     channel = f"iv-{interview_id[:8]}"
@@ -190,6 +244,7 @@ def session_start():
         session=session,
         settings=settings,
         interview_id=interview_id,
+        dossier=_dossier,
     )
     # The opener fires when the candidate joins the channel.
     session.set_on_user_joined(pipeline.on_candidate_joined)
@@ -207,6 +262,7 @@ def session_start():
         channel=channel,
         uid=CANDIDATE_UID,
         token=candidate_token,
+        panel=list(pipeline.panel),
     )
 
 
@@ -227,16 +283,17 @@ def session_conclude():
     if _pipeline is None:
         raise HTTPException(409, "no active session")
     _pipeline.freeze()
-    transcript, claims, coverage, panel = _pipeline.report_inputs()
+    transcript, claims, coverage, panel, contexts = _pipeline.report_inputs()
     if not any(t.speaker == "candidate" for t in transcript):
         raise HTTPException(400, "no candidate answers to score yet")
     global _panel_record
     logger.info("concluding interview %s", _pipeline.interview_id)
-    _report = scoring.build_report(_pipeline.interview_id, panel, transcript, claims, coverage)
+    _report = scoring.build_report(_pipeline.interview_id, panel, transcript, claims,
+                                   coverage, contexts)
     # Retain the full record so the recruiter can interrogate it (Phase 6).
     _panel_record = ask_panel.PanelRecord(
         interview_id=_pipeline.interview_id, report=_report,
-        transcript=transcript, claims=claims,
+        transcript=transcript, claims=claims, contexts=contexts,
         audit=[a.model_dump() for a in _pipeline.audit],
     )
     return _report

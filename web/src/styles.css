@@ -129,3 +129,43 @@ button.finish { background:#16a34a; border-color:#15803d; color:#fff; }
 
 .log { margin-top:16px; background:#070b18; color:#9ae6b4; padding:10px 12px; border-radius:10px; border:1px solid var(--line);
        height:150px; overflow-y:auto; font-family: ui-monospace, monospace; font-size:.75rem; white-space:pre-wrap; }
+
+/* Phase 7 — dossier setup */
+.setup { background:var(--card); border:1px solid var(--line); border-radius:14px;
+         padding:16px; margin-bottom:18px; }
+.setup-head { display:flex; flex-direction:column; gap:4px; margin-bottom:12px; }
+.setup-head strong { font-size:.95rem; }
+.setup-sub { color:var(--dim); font-size:.8rem; line-height:1.5; }
+.setup-cols { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+@media (max-width:640px) { .setup-cols { grid-template-columns:1fr; } }
+.setup-col { display:flex; flex-direction:column; gap:8px; }
+.filebtn { display:inline-flex; align-items:center; justify-content:center; gap:8px;
+           background:var(--card2); border:1px dashed var(--line); color:var(--text);
+           border-radius:10px; padding:9px 14px; font-size:.85rem; font-weight:600;
+           cursor:pointer; text-align:center; }
+.filebtn:hover { border-color:var(--accent); }
+.filebtn input { display:none; }
+.setup-ta { background:var(--card2); color:var(--text); border:1px solid var(--line);
+            border-radius:10px; padding:10px 12px; font-family:inherit; font-size:.85rem;
+            line-height:1.5; min-height:120px; resize:vertical; }
+.setup-ta:focus { outline:none; border-color:var(--accent); }
+.setup-actions { margin-top:12px; }
+.dossier { margin-top:14px; padding-top:14px; border-top:1px solid var(--line);
+           display:flex; flex-direction:column; gap:10px; }
+.dossier-role { font-weight:700; font-size:.95rem; text-transform:capitalize; }
+.dossier-sum { color:var(--dim); font-weight:400; text-transform:none; }
+.dossier-label { color:var(--dim); font-size:.72rem; text-transform:uppercase; letter-spacing:.5px; }
+.pill { display:inline-block; background:var(--card2); border:1px solid var(--line);
+        border-radius:999px; padding:3px 10px; margin:2px 4px 2px 0; font-size:.78rem; }
+.pill-w { color:var(--accent); border-color:var(--accent); }
+.dossier-claims ul { margin:6px 0 0; padding-left:18px; }
+.dossier-claims li { font-size:.82rem; color:var(--text); margin:3px 0; line-height:1.4; }
+.dossier-claims em { color:var(--dim); font-style:normal; font-size:.74rem; }
+
+/* Phase 7 — off-panel interviewers (dossier dropped them for this role) */
+.tile.off-panel { opacity:.4; filter:grayscale(1); position:relative; }
+.tile.off-panel .avatar { box-shadow:none; }
+.offbadge { position:absolute; top:8px; left:50%; transform:translateX(-50%);
+            font-size:.6rem; text-transform:uppercase; letter-spacing:.4px;
+            color:var(--dim); background:var(--card2); border:1px solid var(--line);
+            border-radius:6px; padding:2px 6px; white-space:nowrap; }
