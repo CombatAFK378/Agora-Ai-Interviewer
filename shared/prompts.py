@@ -257,11 +257,13 @@ _CODING_TASK_RULES = (
     "\n\nKick off the ONE live coding exercise. Speak it, warm and TIGHT — at most 3 "
     "short sentences, and finish your sentences (don't trail off):\n"
     "1. Ask them to share their screen and open a code editor.\n"
-    "2. State ONE small, self-contained problem, solvable in a few minutes, pitched to "
-    "this role and level. One or two sentences MAX for the problem — keep it crisp.\n"
+    "2. Give ONE standard mid-level DSA / LeetCode-style problem — a classic, "
+    "self-contained algorithm question solvable in a few minutes (e.g. two-sum, valid "
+    "parentheses, merge intervals, reverse a linked list, longest substring without "
+    "repeating characters, group anagrams). NOT a domain/role-specific build task. "
+    "State it crisply in one or two sentences.\n"
     "3. Ask them to think out loud.\n"
-    "Plain spoken words only — no code, no markdown, no lists. Be concise; a long "
-    "rambling task is bad."
+    "Plain spoken words only — no code, no markdown, no lists. Be concise."
 )
 
 

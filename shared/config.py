@@ -37,6 +37,11 @@ class Settings(BaseSettings):
     # No fallback chain (text models can't see) — coding degrades to verbal on fail.
     llm_vision_fast: str = "openrouter:google/gemma-4-26b-a4b-it:free"
     llm_vision_model: str = "openrouter:google/gemma-4-31b-it:free"
+    # Gemini Live (§8): realtime screen-watch + voice for the coding round, run in
+    # the browser via a server-minted ephemeral token. If the key is unset the
+    # coding round falls back to the snapshot-vision path above.
+    gemini_api_key: str = ""
+    gemini_live_model: str = "gemini-3.1-flash-live-preview"
     # Free vision tiers rate-limit (429) often, so a vision read falls through this
     # chain before giving up (all verified free + image-capable on OpenRouter).
     llm_vision_fallbacks: str = ("openrouter:google/gemma-4-31b-it:free,"

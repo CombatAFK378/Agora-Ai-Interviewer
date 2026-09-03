@@ -25,7 +25,7 @@ from pydantic import BaseModel
 from shared.config import get_settings
 from shared.agora_token import build_rtc_token
 from shared.models import AskAnswer, Dossier, InterviewReport, Override, SessionStartResponse, WhatIfQuery
-from shared import ask_panel, dossier as dossier_mod, prompts, scoring, store
+from shared import ask_panel, dossier as dossier_mod, gemini, prompts, scoring, store
 
 from agora_session import AgoraSession
 from pipeline import InterviewPipeline
@@ -274,12 +274,60 @@ class FrameRequest(BaseModel):
     frame: str   # data: URI of a screen-share JPEG/PNG
 
 
+class CodingResultRequest(BaseModel):
+    verdict: str = "done"     # done | cheating | error
+    summary: str = ""         # Gemini's read of how the round went
+
+
 @app.post("/coding/frame")
 def coding_frame(req: FrameRequest):
     """Latest screen-share frame from the browser during the coding round (§8)."""
     if _pipeline is None:
         raise HTTPException(409, "no active session")
     _pipeline.set_frame(req.frame)
+    return {"status": "ok"}
+
+
+class ClientLogRequest(BaseModel):
+    line: str
+
+
+@app.post("/client-log")
+def client_log(req: ClientLogRequest):
+    """Mirror the browser's on-screen log into data/client.log so it's inspectable
+    server-side (esp. the Gemini coding round, which runs entirely in the browser)."""
+    try:
+        os.makedirs(get_settings().data_dir, exist_ok=True)
+        with open(os.path.join(get_settings().data_dir, "client.log"), "a", encoding="utf-8") as f:
+            f.write(req.line.rstrip()[:2000] + "\n")
+    except Exception:
+        pass
+    return {"status": "ok"}
+
+
+@app.post("/coding/gemini-token")
+def coding_gemini_token():
+    """Mint a short-lived ephemeral token so the browser can open the Gemini Live
+    coding session (§8) — the real key never leaves the server."""
+    if _pipeline is None:
+        raise HTTPException(409, "no active session")
+    if not gemini.enabled():
+        raise HTTPException(400, "Gemini Live not configured")
+    try:
+        token = gemini.mint_ephemeral_token()
+    except Exception as e:
+        logger.exception("gemini token mint failed")
+        raise HTTPException(502, f"token mint failed: {e}")
+    return {"token": token, "model": get_settings().gemini_live_model}
+
+
+@app.post("/coding/result")
+def coding_result(req: CodingResultRequest):
+    """The browser Gemini session reports the coding round's outcome (§8): records
+    evidence, drops Liam from the panel, and the rest of the interview continues."""
+    if _pipeline is None:
+        raise HTTPException(409, "no active session")
+    _pipeline.finish_coding_external(req.verdict, req.summary)
     return {"status": "ok"}
 
 

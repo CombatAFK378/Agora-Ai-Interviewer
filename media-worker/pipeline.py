@@ -37,6 +37,7 @@ import stt
 import tts
 
 from shared import dossier as dossier_mod
+from shared import gemini
 from shared import llm_router, orchestrator, prompts
 from shared.competencies import DEFAULT_COMPETENCIES, Competency
 from shared.config import Settings
@@ -59,6 +60,12 @@ QUESTION_CONTEXT_TURNS = 16
 # Coding round (§8): how often Liam proactively looks at the screen and comments
 # while the candidate codes, between their spoken turns.
 CODING_WATCH_SECS = 22.0
+# Safety net for the Gemini-driven round: end it if the browser never reports back.
+CODING_MAX_SECS = 600.0
+# The coding round is a REQUIRED phase, not a bid: trigger it after this many
+# candidate answers if Liam is on the panel (so it happens even if the candidate
+# never steers toward coding).
+CODING_TRIGGER_TURNS = 5
 
 
 class InterviewPipeline:
@@ -130,8 +137,10 @@ class InterviewPipeline:
         self._coding_in_panel = "coding" in self.panel
         self._coding_mode = False                  # round active → floor locked to Liam
         self._coding_done = False                  # round wrapped → Liam off the panel
+        self._coding_gemini = False                # round driven by browser Gemini Live
         self._coding_lock = threading.Lock()       # one Liam coding turn at a time
         self._coding_thread: threading.Thread | None = None
+        self._reply_n = 0                          # candidate answers handled (coding trigger)
 
         # UI/speaker signals (wired to a WebSocket by main; None = just log).
         self.on_event: Optional[Callable[[dict], None]] = None
@@ -296,9 +305,12 @@ class InterviewPipeline:
         snapshot = self._snapshot_transcript()
 
         # Coding round is a locked phase (§8): while it's on, Liam owns the floor —
-        # no bidding, no switching to other interviewers — until he wraps it.
+        # no bidding, no switching to other interviewers — until he wraps it. When
+        # Gemini Live drives it (browser), the server stays idle and just waits for
+        # the result; otherwise the snapshot-vision engine runs the turn here.
         if self._coding_mode:
-            self._coding_turn(snapshot)
+            if not self._coding_gemini:
+                self._coding_turn(snapshot)
             return
 
         # A clarification ("can you repeat?", "I didn't get it") is not a new
@@ -316,6 +328,15 @@ class InterviewPipeline:
             if text:
                 self._speak_and_wait(who, text)
                 self.floor.record(who)
+            return
+
+        # The coding round is a REQUIRED phase (§8), not something Liam has to win a
+        # bid for — trigger it deterministically part-way through so it happens even
+        # if the candidate never steers toward code.
+        self._reply_n += 1
+        if ("coding" in self.panel and self._coding_task is None
+                and not self._coding_done and self._reply_n >= CODING_TRIGGER_TURNS):
+            self._enter_coding_round()
             return
 
         self._emit({"type": "thinking"})
@@ -364,6 +385,30 @@ class InterviewPipeline:
         self._speak_and_wait(decision.winner, text)
         self.floor.record(decision.winner)
 
+    def _resume_after_coding(self):
+        """Proactively continue the interview the moment the coding round ends —
+        instead of waiting for the candidate to speak — so there's no dead air after
+        Liam hands back (§8). Runs via _launch, so it's serialized with normal replies."""
+        time.sleep(0.8)
+        if self._stop.is_set() or self._concluded or self._coding_mode or not self.panel:
+            return
+        snapshot = self._snapshot_transcript()
+        self._emit({"type": "thinking"})
+        bids = orchestrator.collect_bids(self.panel, snapshot, self.contexts)
+        self._ingest_claims(bids, snapshot)
+        self.floor.set_coverage(self.ledger.coverage())
+        self._emit_ledger()
+        self._record_trajectory()
+        decision = self.floor.decide(bids)
+        extra = ("The live coding round just finished and Liam has handed back to the "
+                 "panel. In ONE short sentence acknowledge moving on from the coding "
+                 "exercise, then ask a fresh question in YOUR area. Do not wait for the "
+                 "candidate to speak first.")
+        text = self._generate_question(decision.winner, extra=extra)
+        if text:
+            self._speak_and_wait(decision.winner, text)
+            self.floor.record(decision.winner)
+
     def _generate_question(self, agent_id: str, extra: str = "") -> str:
         transcript = self._snapshot_transcript()[-QUESTION_CONTEXT_TURNS:]
         messages = prompts.build_agent_prompt(agent_id, "LIVE", transcript, extra,
@@ -388,30 +433,71 @@ class InterviewPipeline:
         with self._frame_lock:
             return self._frame
 
-    def _enter_coding_round(self):
-        """Liam sets the ONE task and locks the floor to himself (§8)."""
-        self._coding_mode = True
+    def _make_coding_task(self) -> str:
         try:
-            task = llm_router.chat(
+            return llm_router.chat(
                 prompts.build_coding_task_prompt(self.q_contexts.get("coding", "")),
                 model=self.settings.llm_fast_model, max_tokens=320,
                 temperature=0.6, reasoning_effort="low",
             ).strip()
         except Exception:
             logger.exception("coding task generation failed; using a generic one")
-            task = ("Let's do a quick live coding exercise. Please share your screen and "
-                    "open an editor, then write a function that returns the two indices in "
-                    "a list that add up to a target. Think out loud as you go.")
+            return ("Let's do a quick coding exercise. Please share your screen and open "
+                    "an editor, then write a function that returns the indices of the two "
+                    "numbers in a list that add up to a target. Think out loud as you go.")
+
+    def _enter_coding_round(self):
+        """Liam sets the ONE task and locks the floor to himself (§8). Gemini Live runs
+        the round in the browser when configured; otherwise the snapshot engine runs
+        it here."""
+        self._coding_mode = True
+        task = self._make_coding_task()
         self._coding_task = task
-        self._emit({"type": "coding_task", "text": task})   # UI nudges screen share
-        logger.info("coding round: task set, floor locked to Liam")
+        if gemini.enabled():
+            # Browser-driven: Gemini greets + runs the round; the server stays idle
+            # and waits for finish_coding_external. A watchdog prevents a stall.
+            self._coding_gemini = True
+            # Speak a bridge line over the normal panel voice first, so Liam isn't
+            # silent while the candidate decides to share (Gemini can't start until
+            # the screen is shared).
+            self._speak_and_wait("coding",
+                                 "Alright, let's do a short live coding exercise. Please "
+                                 "share your entire screen, and I'll give you the problem "
+                                 "and walk through it with you.")
+            self._emit({"type": "coding_gemini", "task": task})
+            logger.info("coding round: Gemini Live (browser) — floor locked, server idle")
+            threading.Thread(target=self._coding_watchdog, daemon=True,
+                             name="coding-watchdog").start()
+            return
+        # Fallback: snapshot-vision engine, Liam runs it from here.
+        self._emit({"type": "coding_task", "text": task})
+        logger.info("coding round: snapshot vision — floor locked to Liam")
         self._speak_and_wait("coding", task)
         self.floor.record("coding")
-        # Watch loop: Liam proactively looks at the screen and comments while the
-        # candidate codes, even between their spoken turns (§8).
         self._coding_thread = threading.Thread(target=self._coding_loop, daemon=True,
                                                name="coding-watch")
         self._coding_thread.start()
+
+    def _coding_watchdog(self):
+        """Safety net for the Gemini round: if the browser session dies without
+        reporting a result, end the round so the interview doesn't stall (§8)."""
+        waited = 0.0
+        while (waited < CODING_MAX_SECS and self._coding_mode
+               and not self._stop.is_set() and not self._concluded):
+            time.sleep(1.0)
+            waited += 1.0
+        if self._coding_mode and self._coding_gemini:
+            logger.warning("coding watchdog fired (%.0fs); ending round", waited)
+            self._end_coding_round("done", "(coding round ended by timeout)")
+
+    def finish_coding_external(self, verdict: str, summary: str = ""):
+        """Called from /coding/result when the browser Gemini session ends the round."""
+        if not self._coding_mode:
+            return
+        verdict = (verdict or "done").lower()
+        if verdict not in ("done", "cheating", "error"):
+            verdict = "done"
+        self._end_coding_round(verdict, (summary or "").strip() or "(no summary)")
 
     def _coding_loop(self):
         """While the round is on, comment on the screen every CODING_WATCH_SECS —
@@ -466,25 +552,19 @@ class InterviewPipeline:
             self._emit({"type": "thinking"})
             screen = self._screen_read()
             say, verdict = self._coding_decide(candidate_text, screen)
-            # Cheating requires ACTUAL screen evidence (an AI tool named in the read) —
-            # never a guess from a blank/unreadable screen or a flaky model.
-            screen_shows_cheating = _looks_like_cheating(screen)
-            if verdict == "cheating" and not screen_shows_cheating:
+            # Snapshot fallback does NOT flag cheating — single-frame vision is too
+            # unreliable and false-flags a candidate's own AI-library code. Cheating
+            # detection is Gemini Live's job (continuous video). Here: continue / done.
+            if verdict == "cheating":
                 verdict = "continue"
-            if screen_shows_cheating:
-                verdict = "cheating"
-                if not say:
-                    say = ("I can see an AI assistant open on your screen — that's not "
-                           "allowed for the core logic. That settles my read on this round; "
-                           "I'll hand back to the rest of the panel.")
             if not say:
                 say = "Keep going — talk me through what you're writing."
             if not self._coding_mode:      # round may have ended while we thought
                 return
             self._speak_and_wait("coding", say)
             self.floor.record("coding")
-            if verdict in ("done", "cheating"):
-                self._end_coding_round(verdict, screen)
+            if verdict == "done":
+                self._end_coding_round("done", screen)
         finally:
             self._coding_lock.release()
 
@@ -509,26 +589,38 @@ class InterviewPipeline:
             logger.exception("coding decide failed; continuing")
             return "", "continue"
 
-    def _end_coding_round(self, verdict: str, screen: str):
+    def _end_coding_round(self, verdict: str, detail: str):
         """Wrap the coding round: record evidence and drop Liam from the panel so the
-        rest of the interview continues without him (§8)."""
+        rest of the interview continues without him (§8). `detail` is the Gemini
+        summary or the final screen read. Idempotent."""
+        if not self._coding_mode:
+            return
         self._coding_mode = False
         self._coding_done = True
         self.panel = [a for a in self.panel if a != "coding"]
         self.floor.panel_ids = [a for a in self.floor.panel_ids if a != "coding"]
+        detail = (detail or "").strip()
         if verdict == "cheating":
             self.ledger.add(
-                text=f"Coding round: candidate used an AI assistant / outside help "
-                     f"(screen: {screen[:140]}). Integrity flag — coding not demonstrated.",
+                text=f"Coding round: outside/AI help detected — integrity flag, coding "
+                     f"not demonstrated. {detail[:180]}",
                 competency="coding", source_turn=self._seq, strength=0.9,
-                status="SOLID", noticed_by="vision")
-        else:
+                status="SOLID", noticed_by="coding")
+        elif verdict == "error":
             self.ledger.add(
-                text=f"Coding round (final screen): {screen[:180]}",
+                text="Coding round could not run (technical issue) — not assessed.",
+                competency="coding", source_turn=self._seq, strength=0.2,
+                status="VAGUE", noticed_by="coding")
+        else:  # done
+            self.ledger.add(
+                text=f"Coding round: {detail[:200]}",
                 competency="coding", source_turn=self._seq, strength=0.7,
-                status="SOLID", noticed_by="vision")
+                status="SOLID", noticed_by="coding")
         self._emit({"type": "coding_done", "verdict": verdict})
         logger.info("coding round ended: verdict=%s; Liam removed from panel", verdict)
+        # Proactively resume the panel so there's no dead air waiting for the
+        # candidate to speak (§8). Via _launch so it's serialized with normal replies.
+        self._launch(self._resume_after_coding)
 
     def assess_coding(self) -> None:
         """Conclude-time safety net (§8): if the round never formally wrapped (e.g. the

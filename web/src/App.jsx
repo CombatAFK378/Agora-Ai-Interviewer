@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import AgoraRTC from "agora-rtc-sdk-ng";
 import { AIDenoiserExtension } from "agora-extension-ai-denoiser";
+import { startGeminiCoding } from "./geminiCoding";
 
 // The denoiser's WASM is loaded from the CDN (kept out of the bundle). If the
 // browser blocks it, we fall back to the raw mic — see makeMicTrack().
@@ -104,11 +105,14 @@ export default function App() {
   const [interviews, setInterviews] = useState([]); // past interview summaries
   const [storedId, setStoredId] = useState(null); // opened stored interview id
   // Phase 8 — coding round (screen share + vision).
-  const [codingTask, setCodingTask] = useState(null);
+  const [codingTask, setCodingTask] = useState(null);       // snapshot-mode task text
+  const [geminiTask, setGeminiTask] = useState(null);       // Gemini-mode task text
+  const [geminiActive, setGeminiActive] = useState(false);  // Gemini Live session running
   const [sharing, setSharing] = useState(false);
   const [finished, setFinished] = useState([]); // interviewer ids done (e.g. coding)
   const screenRef = useRef(null); // MediaStream
   const frameTimer = useRef(null);
+  const geminiRef = useRef(null); // Gemini Live controller
   const logRef = useRef(null);
 
   const client = useRef(null);
@@ -116,10 +120,19 @@ export default function App() {
   const ws = useRef(null);
   const denoiser = useRef(null);
 
-  const log = useCallback(
-    (m) => setLogLines((l) => [...l.slice(-200), `[${new Date().toLocaleTimeString()}] ${m}`]),
-    []
-  );
+  const log = useCallback((m) => {
+    const line = `[${new Date().toLocaleTimeString()}] ${m}`;
+    setLogLines((l) => [...l.slice(-200), line]);
+    // Mirror to the server (data/client.log) so it's inspectable outside the browser.
+    try {
+      fetch("/client-log", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ line }),
+        keepalive: true,
+      });
+    } catch { /* best-effort */ }
+  }, []);
   useEffect(() => {
     if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
   }, [logLines]);
@@ -161,12 +174,19 @@ export default function App() {
       } else if (ev.type === "coding_task") {
         setCodingTask(ev.text);
         log("🖥️ coding task set — share your screen so Liam can watch");
+      } else if (ev.type === "coding_gemini") {
+        setGeminiTask(ev.task);
+        log("🖥️ coding task set — share your entire screen to code live with Liam");
       } else if (ev.type === "screen_read") {
         log("👁️ Liam sees: " + ev.text);
       } else if (ev.type === "coding_done") {
         setFinished((f) => (f.includes("coding") ? f : [...f, "coding"]));
         setCodingTask(null);
+        setGeminiTask(null);
+        setGeminiActive(false);
         stopSharing();
+        stopGemini();
+        if (mic.current) { try { mic.current.setMuted(false); } catch { /* noop */ } }
         log(
           ev.verdict === "cheating"
             ? "🚩 Liam flagged the coding round (outside help) — handing back to the panel"
@@ -284,6 +304,8 @@ export default function App() {
       setActivePanel(s.panel || []);
       setFinished([]);
       setCodingTask(null);
+      setGeminiTask(null);
+      setGeminiActive(false);
       log(`channel=${s.channel} uid=${s.uid} panel=${(s.panel || []).join(",")}`);
       setStatus("Joining channel…");
       await connectAgora(s);
@@ -311,6 +333,8 @@ export default function App() {
       setJoined(true);
       setTalking(true);
       setSpeaking(null);
+      setFinished([]);    // the "coding done" greying is interview-only; Liam answers here
+      setActivePanel([]); // Ask-the-Panel: every interviewer can speak, none greyed
       setStatus("In voice with the panel — just talk.");
       log("🎙️ joined the panel — ask by voice");
     } catch (e) {
@@ -379,6 +403,84 @@ export default function App() {
     setSharing(false);
   }
 
+  function stopGemini() {
+    if (geminiRef.current) {
+      try { geminiRef.current.stop(); } catch { /* noop */ }
+      geminiRef.current = null;
+    }
+  }
+
+  // Gemini Live coding round (§8): share the ENTIRE screen, then talk + code live
+  // with Liam (browser-side). The Agora panel is muted for the duration.
+  async function startCodingGemini() {
+    try {
+      const stream = await navigator.mediaDevices.getDisplayMedia({
+        video: { displaySurface: "monitor", frameRate: 2 },
+        audio: false,
+      });
+      const surface = stream.getVideoTracks()[0].getSettings().displaySurface;
+      if (surface && surface !== "monitor") {
+        stream.getTracks().forEach((t) => t.stop());
+        setStatus("Please share your ENTIRE screen (not a window or tab), then try again.");
+        log(`❌ shared a ${surface}, not the whole screen — rejected.`);
+        return;
+      }
+      screenRef.current = stream;
+      stream.getVideoTracks()[0].onended = () => stopGemini();
+
+      const r = await fetch("/coding/gemini-token", { method: "POST" });
+      if (!r.ok) throw new Error(`token ${r.status} ${await r.text()}`);
+      const { token, model } = await r.json();
+
+      if (mic.current) { try { mic.current.setMuted(true); } catch { /* noop */ } } // silence Agora panel
+      setGeminiActive(true);
+      setStatus("Live coding with Liam — talk and code, he can see your screen.");
+      log("🎙️ Gemini Live coding round started");
+
+      geminiRef.current = await startGeminiCoding({
+        token,
+        model,
+        task: geminiTask || "",
+        screenStream: stream,
+        log: (m) => log("gemini: " + m),
+        onStatus: (s) => log("gemini: " + s),
+        onSpeaking: (on) => setSpeaking(on ? "coding" : null),
+        onFinish: async (verdict, summary) => {
+          log(`gemini: round ended (${verdict})`);
+          try {
+            await fetch("/coding/result", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ verdict, summary }),
+            });
+          } catch (e) {
+            log("coding result post failed: " + (e.message || e));
+          }
+          if (screenRef.current) {
+            screenRef.current.getTracks().forEach((t) => t.stop());
+            screenRef.current = null;
+          }
+          geminiRef.current = null;
+          setGeminiActive(false);
+          // coding_done event will clear the banner + unmute the panel
+        },
+      });
+    } catch (e) {
+      log("gemini coding error: " + (e.message || e));
+      setStatus("Couldn't start live coding — see log.");
+      setGeminiActive(false);
+      if (mic.current) { try { mic.current.setMuted(false); } catch { /* noop */ } }
+      // Tell the server so the round doesn't stall; it ends gracefully.
+      try {
+        await fetch("/coding/result", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ verdict: "error", summary: String(e.message || e) }),
+        });
+      } catch { /* noop */ }
+    }
+  }
+
   async function loadInterviews() {
     try {
       const r = await fetch("/interviews");
@@ -440,6 +542,7 @@ export default function App() {
 
   async function leave() {
     stopSharing();
+    stopGemini();
     try {
       await disconnectAgora();
       await fetch("/session/stop", { method: "POST" });
@@ -451,6 +554,8 @@ export default function App() {
     setSpeaking(null);
     setThinking(false);
     setCodingTask(null);
+    setGeminiTask(null);
+    setGeminiActive(false);
     setFinished([]);
     setStatus("Idle.");
     log("left channel");
@@ -727,6 +832,25 @@ export default function App() {
             Leave
           </button>
           <span className="status">{status}</span>
+        </div>
+      )}
+
+      {view === "room" && joined && !talking && geminiTask && (
+        <div className="coding">
+          <div className="coding-head">
+            <strong>🖥️ Live coding task (with Liam)</strong>
+            {geminiActive ? (
+              <button className="ghost" onClick={stopGemini}>End coding</button>
+            ) : (
+              <button className="join" onClick={startCodingGemini}>Share entire screen &amp; start</button>
+            )}
+          </div>
+          <div className="coding-task">{geminiTask}</div>
+          <div className="coding-note">
+            {geminiActive
+              ? "Live with Liam — he can see your screen and hear you. Talk through your code as you go."
+              : "🎧 Use headphones (avoids echo). Share your ENTIRE screen to start — Liam watches you code and talks in real time. A window or tab share is rejected."}
+          </div>
         </div>
       )}
 
