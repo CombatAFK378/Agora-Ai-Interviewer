@@ -10,9 +10,17 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
+      // /session carries the events WebSocket as well as the REST calls.
       "/session": { target: "http://localhost:8080", ws: true, changeOrigin: true },
       "/panel": "http://localhost:8080",
       "/health": "http://localhost:8080",
+      // These were missing, so in dev the recruiter dashboard, PDF upload and
+      // the coding round all 404'd against Vite instead of reaching the worker.
+      "/interviews": "http://localhost:8080",
+      "/parse-pdf": "http://localhost:8080",
+      "/coding": "http://localhost:8080",
+      "/report": "http://localhost:8080",
+      "/client-log": "http://localhost:8080",
     },
   },
   build: { outDir: "dist" },
