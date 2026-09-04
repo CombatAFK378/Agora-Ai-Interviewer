@@ -137,9 +137,11 @@ export async function startGeminiCoding({
   let inCtx = null;
   let proc = null;
   let frameTimer = null;
+  let watchTimer = null;
 
   function stopInput() {
     if (frameTimer) clearInterval(frameTimer);
+    if (watchTimer) clearInterval(watchTimer);
     try { proc && proc.disconnect(); } catch { /* noop */ }
     try { micStream && micStream.getTracks().forEach((t) => t.stop()); } catch { /* noop */ }
     try { inCtx && inCtx.close(); } catch { /* noop */ }
@@ -304,8 +306,32 @@ export async function startGeminiCoding({
       frameCount += 1;
       if (frameCount === 1) log(`first screen frame sent (${canvas.width}x${canvas.height})`);
     } catch { /* session may be closing */ }
-  }, 3000);
-  log("screen frames streaming every 3s");
+  }, 1500);
+  log("screen frames streaming every 1.5s");
+
+  // Proactive "watch check": while the candidate codes silently there's no speech
+  // to trigger a turn, so Gemini wouldn't look at the screen. Nudge it periodically
+  // to assess the current frame — flag cheating immediately, else a brief comment.
+  watchTimer = setInterval(() => {
+    if (finished) return;
+    try {
+      session.sendClientContent({
+        turns: [{
+          role: "user",
+          parts: [{
+            text:
+              "[watch check — I may be coding silently] Look at my screen RIGHT NOW. " +
+              "If an AI assistant/chatbot (ChatGPT, Claude, Copilot, Gemini) is open, or a " +
+              "full solution is pasted in, say so and call finish_coding with cheating " +
+              "immediately. Otherwise give ONE short comment on my progress or a nudge if " +
+              "I seem stuck — keep it to a single sentence.",
+          }],
+        }],
+        turnComplete: true,
+      });
+    } catch { /* session may be closing */ }
+  }, 12000);
+  log("watch-check nudges every 12s");
 
   return { stop: () => finish("done", "(coding round ended)") };
 }

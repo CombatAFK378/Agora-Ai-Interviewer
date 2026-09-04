@@ -50,7 +50,12 @@ PENDING_MAX_SECS = 30.0
 # After Smart Turn says "not done yet", how long the candidate may stay silent
 # (thinking, gathering words) before we finalize the turn anyway. Short values
 # cut people off mid-thought; this is generous on purpose.
-PENDING_TIMEOUT_SECS = 4.0
+PENDING_TIMEOUT_SECS = 5.0
+# When Smart Turn is CONFIDENT the candidate is mid-sentence (p_complete below
+# this), wait this much longer before finalizing — a longer thinking pause on an
+# obviously unfinished sentence shouldn't hand the floor to the panel.
+PENDING_MIDSENTENCE_PROB = 0.20
+PENDING_TIMEOUT_LONG_SECS = 10.0
 OPENER_DELAY_SECS = 1.5
 MIN_SPEECH_RMS = 350.0
 BARGEIN_GRACE_SECS = 1.0
@@ -241,8 +246,17 @@ class InterviewPipeline:
     def _check_pending_timeout(self):
         if not self._pending or self._pending_since is None:
             return
-        if time.monotonic() - self._pending_since >= PENDING_TIMEOUT_SECS:
-            logger.info("pending utterance timed out; finalising")
+        # When Smart Turn was CONFIDENT the candidate is mid-sentence (very low
+        # p_complete — e.g. they trailed off "…which is our"), give them much longer
+        # to gather their thoughts before we finalise. Otherwise a normal thinking
+        # pause cuts them off and the panel jumps in. A clearer end gets the short
+        # timeout so the panel stays responsive.
+        timeout = (PENDING_TIMEOUT_LONG_SECS
+                   if self.smart_turn.last_prob < PENDING_MIDSENTENCE_PROB
+                   else PENDING_TIMEOUT_SECS)
+        if time.monotonic() - self._pending_since >= timeout:
+            logger.info("pending utterance timed out (%.1fs, p=%.3f); finalising",
+                        timeout, self.smart_turn.last_prob)
             pcm = bytes(self._pending)
             self._pending = bytearray()
             self._pending_since = None

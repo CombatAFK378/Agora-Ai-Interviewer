@@ -33,6 +33,7 @@ MAX_SAMPLES = SAMPLE_RATE * MAX_SECONDS  # 128000 -> 800 mel frames
 class SmartTurn:
     def __init__(self, model_path: str, threshold: float = 0.5):
         self.threshold = threshold
+        self.last_prob = 1.0   # probability from the most recent is_complete() call
         self._session = None
         self._feature_extractor = None
 
@@ -76,7 +77,10 @@ class SmartTurn:
         return self._session is not None
 
     def is_complete(self, pcm_bytes: bytes) -> bool:
-        """True if the utterance sounds finished (or if the model is disabled)."""
+        """True if the utterance sounds finished (or if the model is disabled).
+        The raw probability is stashed on `last_prob` for callers that want to size
+        a follow-up wait by how confidently the turn looked incomplete."""
+        self.last_prob = 1.0
         if self._session is None:
             return True
         try:
@@ -84,6 +88,7 @@ class SmartTurn:
         except Exception:
             logger.exception("Smart Turn inference failed; treating turn as complete")
             return True
+        self.last_prob = prob
         logger.info("Smart Turn p(complete)=%.3f (threshold %.2f)", prob, self.threshold)
         return prob >= self.threshold
 
