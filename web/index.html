@@ -3,7 +3,39 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>968ms — AI Interview Panel</title>
+    <meta name="color-scheme" content="dark" />
+    <title>968ms - AI Interview Panel</title>
+
+    <!-- Inline so there is no extra request and no 404 when none is served.
+         The mark echoes a seat on the stage: the ring is the interviewer, the
+         dot is the live indicator. -->
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230C0E12'/%3E%3Ccircle cx='16' cy='16' r='8' fill='none' stroke='%234FB8D9' stroke-width='2.5'/%3E%3Ccircle cx='16' cy='16' r='2.5' fill='%233ECF8E'/%3E%3C/svg%3E"
+    />
+
+    <!-- Approximating Claude's typography. Its real faces are Styrene and
+         Tiempos, both commercially licensed and not distributable here, so:
+         Source Serif 4 stands in for Tiempos on display, Hanken Grotesk for
+         Styrene in the interface, and Geist Mono stays for anything that has
+         to line up in a column: scores, percentages, turn numbers, the hash. -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Geist+Mono:ital,wght@0,400;0,500;0,600;1,400;1,500&family=Hanken+Grotesk:wght@400;500;600;700&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;1,8..60,400&display=swap"
+    />
+
+    <!-- Phosphor icon font. Every icon in the app is paired with a text label,
+         so if this is blocked the interface still reads correctly. -->
+    <link
+      rel="stylesheet"
+      href="https://unpkg.com/@phosphor-icons/web@2.1.1/src/regular/style.css"
+    />
+    <link
+      rel="stylesheet"
+      href="https://unpkg.com/@phosphor-icons/web@2.1.1/src/fill/style.css"
+    />
   </head>
   <body>
     <div id="root"></div>

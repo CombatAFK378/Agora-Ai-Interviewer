@@ -3,72 +3,29 @@ import AgoraRTC from "agora-rtc-sdk-ng";
 import { AIDenoiserExtension } from "agora-extension-ai-denoiser";
 import { startGeminiCoding } from "./geminiCoding";
 
+import PanelTiles from "./components/PanelTiles";
+import Captions from "./components/Captions";
+import LiveEvidence from "./components/LiveEvidence";
+import SetupDossier from "./components/SetupDossier";
+import Dashboard from "./components/Dashboard";
+import Report from "./components/Report";
+import AskPanel from "./components/AskPanel";
+import CodingRound, { CodingVerdict } from "./components/CodingRound";
+import Stage from "./components/Stage";
+import Timeline from "./components/Timeline";
+import { startLevelMeters, createPanner } from "./lib/audioLevel";
+
 // The denoiser's WASM is loaded from the CDN (kept out of the bundle). If the
-// browser blocks it, we fall back to the raw mic — see makeMicTrack().
+// browser blocks it, we fall back to the raw mic - see makeMicTrack().
 const DENOISER_ASSETS =
   "https://cdn.jsdelivr.net/npm/agora-extension-ai-denoiser@2.0.2/external";
-const AVATAR_COLORS = ["#4f8cff", "#a855f7", "#ef4444", "#14b8a6", "#f59e0b", "#64748b"];
-
-const initials = (name) => (name || "?").slice(0, 1).toUpperCase();
-
-const prettyKey = (k) =>
-  (k || "").replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
-
-// Confidence trajectory (§11): mean coverage over turns, bold, with faint
-// per-competency lines. Pure inline SVG — no chart library.
-function ConfidenceChart({ trajectory }) {
-  if (!trajectory || trajectory.length < 2) return null;
-  const W = 640, H = 200, pad = 28;
-  const n = trajectory.length;
-  const x = (i) => pad + (i * (W - 2 * pad)) / (n - 1);
-  const y = (v) => H - pad - Math.max(0, Math.min(1, v)) * (H - 2 * pad);
-  const keys = Object.keys(trajectory[trajectory.length - 1].coverage || {});
-  const line = (getter) => trajectory.map((p, i) => `${x(i)},${y(getter(p))}`).join(" ");
-  const meanPts = line((p) => p.mean);
-  const areaPts = `${pad},${H - pad} ${meanPts} ${x(n - 1)},${H - pad}`;
-  return (
-    <div className="chart">
-      <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" className="chart-svg">
-        {[0, 0.25, 0.5, 0.75, 1].map((g) => (
-          <g key={g}>
-            <line x1={pad} y1={y(g)} x2={W - pad} y2={y(g)} className="grid" />
-            <text x={4} y={y(g) + 3} className="axis">{Math.round(g * 100)}</text>
-          </g>
-        ))}
-        {keys.map((k, ci) => (
-          <polyline
-            key={k}
-            points={line((p) => (p.coverage || {})[k] ?? 0)}
-            fill="none"
-            stroke={AVATAR_COLORS[ci % AVATAR_COLORS.length]}
-            strokeWidth="1"
-            opacity="0.45"
-          />
-        ))}
-        <polygon points={areaPts} className="chart-area" />
-        <polyline points={meanPts} className="chart-mean" fill="none" />
-        {trajectory.map((p, i) => (
-          <circle key={i} cx={x(i)} cy={y(p.mean)} r="2.5" className="chart-dot" />
-        ))}
-      </svg>
-      <div className="chart-legend">
-        <span className="lg lg-mean">panel mean</span>
-        {keys.map((k, ci) => (
-          <span className="lg" key={k}>
-            <i style={{ background: AVATAR_COLORS[ci % AVATAR_COLORS.length] }} />
-            {prettyKey(k)}
-          </span>
-        ))}
-      </div>
-    </div>
-  );
-}
 
 export default function App() {
   const [agents, setAgents] = useState([]); // [{id,name,title}]
   const [joined, setJoined] = useState(false);
   const [talking, setTalking] = useState(false); // in voice with the panel (Phase 6)
   const [status, setStatus] = useState("Idle.");
+  const [busy, setBusy] = useState(false); // status spinner
   const [speaking, setSpeaking] = useState(null); // agent id
   const [thinking, setThinking] = useState(false);
   const [agentCap, setAgentCap] = useState(null); // {name,title,text}
@@ -76,14 +33,13 @@ export default function App() {
   const [coverage, setCoverage] = useState([]); // [{key,name,value}]
   const [claims, setClaims] = useState([]); // [{text,competency,strength,status,turn,contradicts}]
   const [contradictions, setContradictions] = useState(0);
-  const [showDebug, setShowDebug] = useState(false);
   const [report, setReport] = useState(null);
   const [scoring, setScoring] = useState(false);
   // Ask the Panel (Phase 6)
   const [askTarget, setAskTarget] = useState("");
   const [askQ, setAskQ] = useState("");
   const [asking, setAsking] = useState(false);
-  const [qa, setQa] = useState([]); // [{q, by, a}]
+  const [qa, setQa] = useState([]); // [{q, by, a, agentId, mode, ts}]
   const [cfAgent, setCfAgent] = useState("");
   const [cfTurn, setCfTurn] = useState("");
   const [cfHypo, setCfHypo] = useState("");
@@ -91,7 +47,14 @@ export default function App() {
   const [ovReason, setOvReason] = useState("");
   const [overrides, setOverrides] = useState([]);
   const [logLines, setLogLines] = useState([]);
-  // Phase 7 — dossier: JD + résumé grounding.
+  const [showLog, setShowLog] = useState(false);
+  // Presenter mode: scales the whole type and spacing scale for a projector.
+  const [presenting, setPresenting] = useState(false);
+  // True only for a report that just came from Finish and score, so the reveal
+  // animation plays at the moment it means something and not every time a
+  // stored interview is reopened.
+  const [freshReport, setFreshReport] = useState(false);
+  // Phase 7 - dossier: JD + resume grounding.
   const [jd, setJd] = useState("");
   const [resume, setResume] = useState("");
   const [jdMeta, setJdMeta] = useState(null); // {filename, pages}
@@ -100,19 +63,63 @@ export default function App() {
   const [dossier, setDossier] = useState(null); // parsed preview
   const [parsing, setParsing] = useState(false);
   const [activePanel, setActivePanel] = useState([]); // dossier-selected interviewer ids
-  // Phase 8 — recruiter dashboard.
+  // Phase 8 - recruiter dashboard.
   const [view, setView] = useState("room"); // "room" | "dashboard"
   const [interviews, setInterviews] = useState([]); // past interview summaries
   const [storedId, setStoredId] = useState(null); // opened stored interview id
-  // Phase 8 — coding round (screen share + vision).
+  // Phase 8 - coding round (screen share + vision).
   const [codingTask, setCodingTask] = useState(null);       // snapshot-mode task text
   const [geminiTask, setGeminiTask] = useState(null);       // Gemini-mode task text
   const [geminiActive, setGeminiActive] = useState(false);  // Gemini Live session running
   const [sharing, setSharing] = useState(false);
+  const [screenRead, setScreenRead] = useState(null);       // what the vision model sees
+  const [codingResult, setCodingResult] = useState(null);   // {verdict, summary}
   const [finished, setFinished] = useState([]); // interviewer ids done (e.g. coding)
+  // Live stage: elapsed clock and turn count, both derived from events we
+  // already receive rather than from anything new on the wire.
+  const [elapsed, setElapsed] = useState(0);
+  const [turnCount, setTurnCount] = useState(0);
+  // Bumped when the inbound track arrives. remoteTrack is a ref written inside
+  // an async Agora callback, which triggers no render, so without this the
+  // level meters could start against null and never retry.
+  const [remoteReady, setRemoteReady] = useState(0);
+  // The interview, kept rather than discarded. Every frame is assembled from
+  // events already arriving; nothing extra crosses the wire.
+  const [timeline, setTimeline] = useState([]);
+  const [scrubIndex, setScrubIndex] = useState(null); // null = live
+  // Event handlers are registered once, so they need refs to read current
+  // values rather than the values captured when the socket was opened.
+  const coverageRef = useRef([]);
+  const claimsRef = useRef([]);
+  const contraRef = useRef(0);
+  const elapsedRef = useRef(0);
+  const turnRef = useRef(0);
+  const frameId = useRef(0);
+  const stageRef = useRef(null);
+  const pushFrame = useCallback((entry) => {
+    setTimeline((tl) => [...tl, {
+      id: ++frameId.current,
+      t: elapsedRef.current,
+      turn: turnRef.current,
+      coverage: coverageRef.current,
+      claims: claimsRef.current,
+      claimCount: claimsRef.current.length,
+      contradictions: contraRef.current,
+      ...entry,
+    }]);
+  }, []);
+  const remoteTrack = useRef(null);   // the panel's single inbound audio track
+  const stopMeters = useRef(null);
+  const panner = useRef(null);
+  // Joining takes seconds (session start, channel join, getUserMedia, the
+  // denoiser WASM). A second click in that window would build a second client
+  // and a second audio graph, and everyone would be heard twice.
+  const joining = useRef(false);
+
   const screenRef = useRef(null); // MediaStream
   const frameTimer = useRef(null);
   const geminiRef = useRef(null); // Gemini Live controller
+  const codingSummary = useRef(null); // held so the verdict card can show it
   const logRef = useRef(null);
 
   const client = useRef(null);
@@ -137,6 +144,49 @@ export default function App() {
     if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
   }, [logLines]);
 
+  useEffect(() => { coverageRef.current = coverage; }, [coverage]);
+  useEffect(() => { claimsRef.current = claims; }, [claims]);
+  useEffect(() => { contraRef.current = contradictions; }, [contradictions]);
+  useEffect(() => { elapsedRef.current = elapsed; }, [elapsed]);
+
+  // Presenter mode drives a class on <html> so the token overrides reach
+  // everything, including elements outside the React root.
+  useEffect(() => {
+    document.documentElement.classList.toggle("presenting", presenting);
+  }, [presenting]);
+
+  // Shortcut for the projector, ignored while typing so it cannot fire from a
+  // job description being pasted into a textarea.
+  useEffect(() => {
+    const onKey = (e) => {
+      const t = e.target;
+      const typing = t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" ||
+                           t.tagName === "SELECT" || t.isContentEditable);
+      if (typing || e.metaKey || e.ctrlKey || e.altKey) return;
+      if (e.key === "p" || e.key === "P") setPresenting((v) => !v);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  // Phosphor comes from a CDN. A venue proxy or an ad blocker can drop it, and
+  // an icon font that fails renders nothing at all, leaving the avatars and the
+  // stage seats as empty circles. Detect it once and let the text stand in.
+  useEffect(() => {
+    let cancelled = false;
+    const mark = () => {
+      if (cancelled) return;
+      const ok = document.fonts && document.fonts.check('1em "Phosphor"');
+      if (!ok) document.documentElement.classList.add("no-icons");
+    };
+    if (document.fonts && document.fonts.ready) {
+      document.fonts.ready.then(mark).catch(mark);
+    } else {
+      mark();
+    }
+    return () => { cancelled = true; };
+  }, []);
+
   // Load the roster up front so tiles render before joining.
   useEffect(() => {
     fetch("/panel")
@@ -145,52 +195,111 @@ export default function App() {
       .catch(() => {});
   }, []);
 
+  // Interview clock. Only runs during a live interview, not in Ask the Panel.
+  useEffect(() => {
+    if (!joined || talking) return;
+    const t = setInterval(() => setElapsed((s) => s + 1), 1000);
+    return () => clearInterval(t);
+  }, [joined, talking]);
+
+  // Voice levels for the speaking ring and the candidate's own mic meter.
+  // These write CSS custom properties at frame rate and never touch state.
+  useEffect(() => {
+    if (!joined || talking || report || !stageRef.current) return;
+    stopMeters.current = startLevelMeters({
+      el: stageRef.current,
+      remoteTrack: remoteTrack.current,
+      micTrack: (() => {
+        try { return mic.current ? mic.current.getMediaStreamTrack() : null; }
+        catch { return null; }
+      })(),
+    });
+    return () => {
+      if (stopMeters.current) { stopMeters.current(); stopMeters.current = null; }
+    };
+  }, [joined, talking, report, remoteReady]);
+
+  // Move the voice to the speaking interviewer's seat.
+  useEffect(() => {
+    if (!panner.current) return;
+    const seated = agents.filter(
+      (a) => !finished.includes(a.id) &&
+             (activePanel.length === 0 || activePanel.includes(a.id))
+    );
+    const i = seated.findIndex((a) => a.id === speaking);
+    if (i < 0 || seated.length < 2) { panner.current.setSeat(0); return; }
+    // spread the seats evenly across the stereo field, left to right
+    panner.current.setSeat((i / (seated.length - 1)) * 2 - 1);
+  }, [speaking, agents, activePanel, finished]);
+
   function openEvents() {
     const url = location.origin.replace(/^http/, "ws") + "/session/events";
     const sock = new WebSocket(url);
     ws.current = sock;
     sock.onmessage = (e) => {
       const ev = JSON.parse(e.data);
-      if (ev.type === "panel") setAgents(ev.agents);
+      if (ev.type === "panel") setAgents(ev.agents || []);
       else if (ev.type === "thinking") {
         setThinking(true);
         setSpeaking(null);
       } else if (ev.type === "speaking") {
         setThinking(false);
         setSpeaking(ev.agent);
-        setAgentCap({ name: ev.name, title: ev.title, text: ev.text });
-        log(`🗣️ ${ev.name} (${ev.title})`);
+        setAgentCap({ id: ev.agent, name: ev.name, title: ev.title, text: ev.text });
+        turnRef.current += 1;
+        setTurnCount(turnRef.current);
+        pushFrame({ kind: "ask", agentId: ev.agent, name: ev.name, title: ev.title, text: ev.text });
+        log(`${ev.name} (${ev.title}) is speaking`);
       } else if (ev.type === "idle") {
         setThinking(false);
         setSpeaking(null);
       } else if (ev.type === "heard") {
         setCandCap(ev.text);
+        pushFrame({ kind: "answer", text: ev.text });
       } else if (ev.type === "ledger") {
         setCoverage(ev.coverage || []);
         setClaims(ev.claims || []);
         setContradictions(ev.contradictions || 0);
+        // The ledger lands just after the turn that produced it, so fold the
+        // new evidence back onto the frame it belongs to.
+        setTimeline((tl) => {
+          if (!tl.length) return tl;
+          const head = tl[tl.length - 1];
+          return [...tl.slice(0, -1), {
+            ...head,
+            coverage: ev.coverage || [],
+            claims: ev.claims || [],
+            claimCount: (ev.claims || []).length,
+            contradictions: ev.contradictions || 0,
+          }];
+        });
       } else if (ev.type === "override" && ev.override) {
         setOverrides((o) => [...o, ev.override]); // override fired by voice
       } else if (ev.type === "coding_task") {
         setCodingTask(ev.text);
-        log("🖥️ coding task set — share your screen so Liam can watch");
+        setCodingResult(null);
+        log("coding task set, share your screen so the coding interviewer can watch");
       } else if (ev.type === "coding_gemini") {
         setGeminiTask(ev.task);
-        log("🖥️ coding task set — share your entire screen to code live with Liam");
+        setCodingResult(null);
+        log("coding task set, share your entire screen to code live");
       } else if (ev.type === "screen_read") {
-        log("👁️ Liam sees: " + ev.text);
+        setScreenRead(ev.text);
+        log("screen read: " + ev.text);
       } else if (ev.type === "coding_done") {
         setFinished((f) => (f.includes("coding") ? f : [...f, "coding"]));
         setCodingTask(null);
         setGeminiTask(null);
         setGeminiActive(false);
+        setScreenRead(null);
+        setCodingResult({ verdict: ev.verdict, summary: codingSummary.current });
         stopSharing();
         stopGemini();
         if (mic.current) { try { mic.current.setMuted(false); } catch { /* noop */ } }
         log(
           ev.verdict === "cheating"
-            ? "🚩 Liam flagged the coding round (outside help) — handing back to the panel"
-            : "✅ coding round complete — Liam is done, panel continues"
+            ? "coding round flagged for outside help, handing back to the panel"
+            : "coding round complete, the panel continues"
         );
       }
     };
@@ -214,7 +323,7 @@ export default function App() {
         proc.setMode("NSNG");
       } catch (_) {}
       track.pipe(proc).pipe(track.processorDestination);
-      log("🧹 AI noise suppression (NSNG) enabled");
+      log("AI noise suppression (NSNG) enabled");
     } catch (e) {
       log("AI denoiser unavailable, using raw mic (" + (e.message || e) + ")");
     }
@@ -225,8 +334,57 @@ export default function App() {
     openEvents();
     client.current = AgoraRTC.createClient({ mode: "rtc", codec: "vp8" });
     client.current.on("user-published", async (user, mt) => {
-      await client.current.subscribe(user, mt);
-      if (mt === "audio") user.audioTrack.play();
+      try {
+        await client.current.subscribe(user, mt);
+      } catch (e) {
+        // Agora does not re-emit for a failed subscribe, so without this log an
+        // audio failure is completely silent, in both senses.
+        log("subscribe failed: " + (e.message || e));
+        return;
+      }
+      if (mt === "audio") {
+        // Agora re-emits user-published after a republish or a reconnect. Without
+        // this teardown the old graph stays wired to its own destination and is
+        // unreachable, so the panel plays twice and cannot be stopped.
+        if (panner.current) { panner.current.stop(); panner.current = null; }
+
+        let track = null;
+        try { track = user.audioTrack.getMediaStreamTrack(); } catch { /* noop */ }
+        remoteTrack.current = track;
+        setRemoteReady((v) => v + 1);
+
+        // Route through our own graph so each interviewer can be panned to
+        // their seat. If that fails we hand playback straight back to Agora,
+        // so the worst case is centred audio, never silence.
+        const p = track ? createPanner(track) : null;
+        if (p) {
+          panner.current = p;
+          // Construction succeeding does not mean audio is flowing: an
+          // AudioContext built off the user gesture can stay suspended. Check
+          // shortly after and fall back on our own, because nobody can recover
+          // from silence manually mid-demo.
+          setTimeout(() => {
+            if (panner.current === p && !p.running()) {
+              p.stop();
+              panner.current = null;
+              try { user.audioTrack.play(); } catch { /* noop */ }
+              log("spatial audio did not start, fell back to plain playback");
+            }
+          }, 800);
+          log("spatial audio on, each interviewer is panned to their seat");
+        } else {
+          user.audioTrack.play();
+        }
+      }
+    });
+    const dropRemote = () => {
+      if (panner.current) { panner.current.stop(); panner.current = null; }
+      remoteTrack.current = null;
+    };
+    client.current.on("user-unpublished", (_u, mt) => { if (mt === "audio") dropRemote(); });
+    client.current.on("user-left", () => dropRemote());
+    client.current.on("connection-state-change", (state) => {
+      if (state === "DISCONNECTED" || state === "RECONNECTING") dropRemote();
     });
     await client.current.join(s.app_id, s.channel, s.token, s.uid);
     mic.current = await makeMicTrack();
@@ -234,6 +392,9 @@ export default function App() {
   }
 
   async function disconnectAgora() {
+    if (stopMeters.current) { stopMeters.current(); stopMeters.current = null; }
+    if (panner.current) { panner.current.stop(); panner.current = null; }
+    remoteTrack.current = null;
     if (ws.current) { ws.current.close(); ws.current = null; }
     if (mic.current) { mic.current.stop(); mic.current.close(); mic.current = null; }
     if (client.current) { try { await client.current.leave(); } catch (_) {} client.current = null; }
@@ -243,7 +404,7 @@ export default function App() {
     const f = fileEl.files && fileEl.files[0];
     if (!f) return;
     setUploading(which);
-    setStatus(`Reading ${f.name}…`);
+    setStatus(`Reading ${f.name}`);
     try {
       const form = new FormData();
       form.append("file", f);
@@ -259,10 +420,10 @@ export default function App() {
         setResumeMeta(meta);
       }
       setDossier(null); // stale once inputs change
-      setStatus(`${d.filename} — ${d.pages} page${d.pages === 1 ? "" : "s"} read.`);
+      setStatus(`${d.filename}, ${d.pages} page${d.pages === 1 ? "" : "s"} read.`);
     } catch (e) {
       log("ERROR: " + (e.message || e));
-      setStatus("PDF upload failed — see log.");
+      setStatus("PDF upload failed, see the log.");
     } finally {
       setUploading(null);
       fileEl.value = ""; // allow re-selecting the same file
@@ -272,7 +433,8 @@ export default function App() {
   async function previewDossier() {
     if (!jd.trim() && !resume.trim()) return;
     setParsing(true);
-    setStatus("Reading JD + résumé…");
+    setBusy(true);
+    setStatus("Reading the job description and resume");
     try {
       const resp = await fetch("/session/dossier", {
         method: "POST",
@@ -282,17 +444,21 @@ export default function App() {
       if (!resp.ok) throw new Error(`${resp.status} ${await resp.text()}`);
       const d = await resp.json();
       setDossier(d);
-      setStatus(`Dossier ready — ${d.seniority} ${d.role}, ${d.panel.length} on the panel.`);
+      setStatus(`Dossier ready. ${d.seniority} ${d.role}, ${d.panel.length} on the panel.`);
     } catch (e) {
       log("ERROR: " + (e.message || e));
-      setStatus("Couldn't parse — see log.");
+      setStatus("Could not parse that, see the log.");
     } finally {
       setParsing(false);
+      setBusy(false);
     }
   }
 
   async function join() {
-    setStatus("Starting session…");
+    if (joining.current || joined) return; // re-entrancy guard, see joining ref
+    joining.current = true;
+    setBusy(true);
+    setStatus("Starting session, building the panel from the dossier");
     try {
       const resp = await fetch("/session/start", {
         method: "POST",
@@ -306,20 +472,33 @@ export default function App() {
       setCodingTask(null);
       setGeminiTask(null);
       setGeminiActive(false);
+      setCodingResult(null);
+      codingSummary.current = null;
+      setElapsed(0);
+      setTurnCount(0);
+      turnRef.current = 0;
+      setTimeline([]);
+      setScrubIndex(null);
+      setAgentCap(null);
+      setCandCap(null);
       log(`channel=${s.channel} uid=${s.uid} panel=${(s.panel || []).join(",")}`);
-      setStatus("Joining channel…");
+      setStatus("Joining the channel");
       await connectAgora(s);
       setJoined(true);
-      setStatus("Live — the panel will greet you shortly.");
-      log("🎤 mic published");
+      setStatus("Live. The panel will greet you shortly.");
+      log("mic published");
     } catch (e) {
       log("ERROR: " + (e.message || e));
-      setStatus("Failed — see log.");
+      setStatus("Failed to start, see the log.");
+    } finally {
+      joining.current = false;
+      setBusy(false);
     }
   }
 
   async function panelJoin() {
-    setStatus("Joining the panel…");
+    setBusy(true);
+    setStatus("Joining the panel");
     try {
       await disconnectAgora();          // leave the interview channel first
       const resp = await fetch("/panel/join", {
@@ -333,13 +512,15 @@ export default function App() {
       setJoined(true);
       setTalking(true);
       setSpeaking(null);
-      setFinished([]);    // the "coding done" greying is interview-only; Liam answers here
+      setFinished([]);    // the "coding done" greying is interview-only
       setActivePanel([]); // Ask-the-Panel: every interviewer can speak, none greyed
-      setStatus("In voice with the panel — just talk.");
-      log("🎙️ joined the panel — ask by voice");
+      setStatus("In voice with the panel, just talk.");
+      log("joined the panel, ask by voice");
     } catch (e) {
       log("panel join error: " + (e.message || e));
-      setStatus("Failed — see log.");
+      setStatus("Failed to join, see the log.");
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -351,12 +532,12 @@ export default function App() {
       });
       // Enforce entire-screen only: the browser won't let us remove the window/tab
       // options, but we refuse anything that isn't the full monitor so a candidate
-      // can't hide an AI tool in an unshared window (§8).
+      // can't hide an AI tool in an unshared window.
       const surface = stream.getVideoTracks()[0].getSettings().displaySurface;
       if (surface && surface !== "monitor") {
         stream.getTracks().forEach((t) => t.stop());
-        setStatus("Please share your ENTIRE screen (not a window or tab), then try again.");
-        log(`❌ shared a ${surface}, not the whole screen — rejected. Share entire screen.`);
+        setStatus("Please share your ENTIRE screen, not a window or tab, then try again.");
+        log(`shared a ${surface}, not the whole screen. Rejected.`);
         return;
       }
       screenRef.current = stream;
@@ -380,12 +561,12 @@ export default function App() {
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ frame }),
           });
-        } catch { /* transient — next tick retries */ }
+        } catch { /* transient - next tick retries */ }
       };
       await capture();
       frameTimer.current = setInterval(capture, 5000); // a frame every 5s
       stream.getVideoTracks()[0].onended = stopSharing; // user hit browser "Stop sharing"
-      log("🖥️ screen sharing started — Liam can see your editor");
+      log("screen sharing started");
     } catch (e) {
       log("screen share error: " + (e.message || e));
     }
@@ -410,8 +591,8 @@ export default function App() {
     }
   }
 
-  // Gemini Live coding round (§8): share the ENTIRE screen, then talk + code live
-  // with Liam (browser-side). The Agora panel is muted for the duration.
+  // Gemini Live coding round: share the ENTIRE screen, then talk + code live
+  // (browser-side). The Agora panel is muted for the duration.
   async function startCodingGemini() {
     try {
       const stream = await navigator.mediaDevices.getDisplayMedia({
@@ -421,8 +602,8 @@ export default function App() {
       const surface = stream.getVideoTracks()[0].getSettings().displaySurface;
       if (surface && surface !== "monitor") {
         stream.getTracks().forEach((t) => t.stop());
-        setStatus("Please share your ENTIRE screen (not a window or tab), then try again.");
-        log(`❌ shared a ${surface}, not the whole screen — rejected.`);
+        setStatus("Please share your ENTIRE screen, not a window or tab, then try again.");
+        log(`shared a ${surface}, not the whole screen. Rejected.`);
         return;
       }
       screenRef.current = stream;
@@ -434,8 +615,8 @@ export default function App() {
 
       if (mic.current) { try { mic.current.setMuted(true); } catch { /* noop */ } } // silence Agora panel
       setGeminiActive(true);
-      setStatus("Live coding with Liam — talk and code, he can see your screen.");
-      log("🎙️ Gemini Live coding round started");
+      setStatus("Live coding. Talk and code, the interviewer can see your screen.");
+      log("Gemini Live coding round started");
 
       geminiRef.current = await startGeminiCoding({
         token,
@@ -447,6 +628,7 @@ export default function App() {
         onSpeaking: (on) => setSpeaking(on ? "coding" : null),
         onFinish: async (verdict, summary) => {
           log(`gemini: round ended (${verdict})`);
+          codingSummary.current = summary; // held for the verdict card
           try {
             await fetch("/coding/result", {
               method: "POST",
@@ -467,7 +649,7 @@ export default function App() {
       });
     } catch (e) {
       log("gemini coding error: " + (e.message || e));
-      setStatus("Couldn't start live coding — see log.");
+      setStatus("Could not start live coding, see the log.");
       setGeminiActive(false);
       if (mic.current) { try { mic.current.setMuted(false); } catch { /* noop */ } }
       // Tell the server so the round doesn't stall; it ends gracefully.
@@ -497,12 +679,13 @@ export default function App() {
       if (!r.ok) throw new Error(`${r.status} ${await r.text()}`);
       const rep = await r.json();
       setReport(rep);
+      setFreshReport(false); // reopened, not just decided: no reveal
       setStoredId(summary.interview_id);
       setQa([]);
       setOverrides(
         summary.override
-          ? [{ original_recommendation: rep.conclusion.recommendation,
-               decision: summary.override, reason: "(logged earlier)" }]
+          ? [{ original_recommendation: (rep.conclusion || {}).recommendation,
+               decision: summary.override, reason: "" }]
           : []
       );
       window.scrollTo({ top: 0, behavior: "smooth" });
@@ -512,6 +695,7 @@ export default function App() {
   }
 
   function backToList() {
+    if (talking) leave(); // otherwise the mic stays hot with no visible control
     setStoredId(null);
     setReport(null);
     setOverrides([]);
@@ -523,7 +707,7 @@ export default function App() {
     if (v === "room") {
       // Returning to the live room from the dashboard: drop any stored report we
       // were viewing (and leave a panel voice call if we joined one) so the room
-      // resets to the fresh setup screen. A live interview can't reach here — the
+      // resets to the fresh setup screen. A live interview can't reach here - the
       // dashboard tab is disabled while one is running.
       if (talking) leave();
       setStoredId(null);
@@ -556,6 +740,12 @@ export default function App() {
     setCodingTask(null);
     setGeminiTask(null);
     setGeminiActive(false);
+    setScreenRead(null);
+    setCodingResult(null);
+    codingSummary.current = null;
+    turnRef.current = 0;
+    setTimeline([]);
+    setScrubIndex(null);
     setFinished([]);
     setStatus("Idle.");
     log("left channel");
@@ -566,28 +756,43 @@ export default function App() {
 
   async function finish() {
     setScoring(true);
-    log("📋 scoring the interview — locking, debating, concluding…");
+    setBusy(true);
+    setStatus("Locking the record, scoring, debating, concluding");
+    log("scoring the interview");
     try {
       const r = await fetch("/session/conclude", { method: "POST" });
       if (!r.ok) throw new Error(`${r.status} ${await r.text()}`);
       setReport(await r.json());
-      log("📋 report ready");
+      setFreshReport(true);
+      setStatus("Report ready.");
+      log("report ready");
     } catch (e) {
       log("scoring error: " + (e.message || e));
+      setStatus("Scoring failed, see the log.");
     }
     setScoring(false);
+    setBusy(false);
   }
 
   async function ask() {
     if (!askQ.trim()) return;
     setAsking(true);
+    const asked = askQ;
     try {
       const r = await fetch("/panel/ask", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ question: askQ, mode: askTarget ? "addressed" : "open", target: askTarget || null }),
       });
+      if (!r.ok) throw new Error(`${r.status} ${await r.text()}`);
       const d = await r.json();
-      setQa((q) => [...q, { q: askQ, by: nameOf(d.answered_by), a: d.answer }]);
+      setQa((q) => [...q, {
+        q: asked,
+        by: nameOf(d.answered_by),
+        a: d.answer,
+        agentId: d.answered_by,
+        mode: d.mode,
+        ts: d.ts,
+      }]);
       if (d.override) setOverrides((o) => [...o, d.override]); // override tool fired
       setAskQ("");
     } catch (e) { log("ask error: " + (e.message || e)); }
@@ -602,11 +807,14 @@ export default function App() {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ turn: Number(cfTurn), hypothetical: cfHypo, agent_id: cfAgent }),
       });
+      if (!r.ok) throw new Error(`${r.status} ${await r.text()}`);
       const d = await r.json();
       setQa((q) => [...q, {
-        q: `Counterfactual @turn ${cfTurn} for ${nameOf(cfAgent)}: “${cfHypo}”`,
+        q: `If at turn ${cfTurn} they had said: "${cfHypo}"`,
         by: nameOf(cfAgent),
-        a: `Would move ${Math.round(d.original_overall * 100)} → ${Math.round(d.new_overall * 100)}. ${d.changes} (locked score unchanged)`,
+        a: `Would move ${Math.round(d.original_overall * 100)} to ${Math.round(d.new_overall * 100)}. ${d.changes} The locked score is unchanged.`,
+        agentId: cfAgent,
+        ts: d.ts,
       }]);
       setCfHypo("");
     } catch (e) { log("counterfactual error: " + (e.message || e)); }
@@ -620,536 +828,294 @@ export default function App() {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ decision: ovDecision, reason: ovReason }),
       });
+      // Without this an error body was pushed into overrides and rendered as a
+      // convincing "decision overridden" card for a write that never happened.
+      if (!r.ok) throw new Error(`${r.status} ${await r.text()}`);
       const d = await r.json();
       setOverrides((o) => [...o, d]);
       setOvReason("");
-    } catch (e) { log("override error: " + (e.message || e)); }
+    } catch (e) {
+      log("override error: " + (e.message || e));
+      setStatus("Override was not recorded, see the log.");
+    }
   }
 
   async function interrupt() {
     try {
       const r = await fetch("/session/interrupt", { method: "POST" });
       const d = await r.json();
-      log(d.interrupted ? "✋ interrupted — go ahead and speak" : "✋ (nobody is speaking)");
+      // The response says whether anyone was actually cut off. That used to go
+      // to the console log only, so the button gave no visible feedback.
+      setStatus(d.interrupted ? "Interrupted. Go ahead and speak." : "Nobody is speaking right now.");
+      log(d.interrupted ? "interrupted" : "interrupt: nobody was speaking");
     } catch (e) {
       log("interrupt error: " + (e.message || e));
     }
   }
 
+  // Rewind. Scrubbing is a pure view concern: it never touches the session,
+  // the audio, or the controls, and live events keep appending underneath.
+  const frame = scrubIndex != null ? timeline[scrubIndex] : null;
+  let viewSpeaking = speaking, viewAgentCap = agentCap, viewCandCap = candCap;
+  let viewCoverage = coverage, viewClaims = claims, viewContra = contradictions;
+  let viewTurn = turnCount, viewElapsed = elapsed;
+  if (frame) {
+    viewCoverage = frame.coverage;
+    viewClaims = frame.claims;
+    viewContra = frame.contradictions;
+    viewTurn = frame.turn;
+    viewElapsed = frame.t;
+    // Walk back for the question and the answer in force at that moment, so an
+    // answer frame still shows the question it was answering.
+    let ask = null, ans = null;
+    for (let i = scrubIndex; i >= 0 && (!ask || !ans); i--) {
+      const f = timeline[i];
+      if (!ask && f.kind === "ask") ask = f;
+      if (!ans && f.kind === "answer") ans = f;
+    }
+    viewAgentCap = ask
+      ? { id: ask.agentId, name: ask.name, title: ask.title, text: ask.text }
+      : null;
+    viewCandCap = ans ? ans.text : null;
+    // Only light the seat if the panel was actually mid-question here.
+    viewSpeaking = frame.kind === "ask" ? frame.agentId : null;
+  }
+
+  const codingName = nameOf("coding");
+  const showRoom = view === "room";
+  // A live interview takes over the room: the setup chrome, the control strip,
+  // the small tiles and the evidence cards are all replaced by the stage.
+  const inInterview = showRoom && joined && !talking && !report;
+  const showTiles = (showRoom || talking) && !inInterview;
+
   return (
     <div className="wrap">
-      <div className="disclosure" role="note">
-        <span className="dot" aria-hidden="true" />
-        AI interview — every interviewer is AI. This session is recorded and transcribed.
-      </div>
-      <h1>968ms — AI Interview Panel</h1>
-      <p className="sub">
-        Five AI interviewers. Whoever's speaking lights up. Answer with your mic; use Interrupt to
-        cut in.
-      </p>
+      <header className="masthead">
+        <div className="mast-id">
+          <h1 className="mast-title"><b>968ms</b> AI Interview Panel</h1>
+          <p className="mast-sub">
+            A panel of AI interviewers with separate objectives. Whoever holds the floor
+            lights up. Answer with your mic, and use Interrupt to cut in.
+          </p>
+        </div>
+        <div className="mast-right">
+          <div className="disclosure" role="note">
+            <span className="dot" aria-hidden="true" />
+            Every interviewer is AI. This session is recorded and transcribed.
+          </div>
+          <button
+            className="ghost present-toggle"
+            onClick={() => setPresenting((v) => !v)}
+            aria-pressed={presenting}
+            title="Scale the interface up for a projector (shortcut: P)"
+          >
+            <i className={"ph " + (presenting ? "ph-corners-in" : "ph-corners-out")}
+               aria-hidden="true" />
+            {presenting ? "Exit presenter mode" : "Presenter mode"}
+          </button>
+        </div>
+      </header>
 
-      <div className="nav">
-        <button className={view === "room" ? "nav-on" : ""} onClick={() => switchView("room")}>
-          🎥 Live interview
+      <nav className="nav">
+        <button className={showRoom ? "nav-on" : ""} onClick={() => switchView("room")}>
+          <i className="ph-fill ph-broadcast" aria-hidden="true" />
+          Live interview
         </button>
         <button
           className={view === "dashboard" ? "nav-on" : ""}
           onClick={() => switchView("dashboard")}
           disabled={joined && !talking}
         >
-          📋 Past interviews
+          <i className="ph ph-folders" aria-hidden="true" />
+          Past interviews
         </button>
-      </div>
+      </nav>
 
       {view === "dashboard" && !report && (
-        <div className="dash">
-          <div className="rep-title">Past interviews ({interviews.length})</div>
-          {interviews.length === 0 && (
-            <div className="empty">— no interviews yet. Run one from the Live tab. —</div>
-          )}
-          {interviews.map((it) => (
-            <button className="dash-row" key={it.interview_id} onClick={() => openInterview(it)}>
-              <div className="dash-main">
-                <span className="dash-name">{it.candidate_name || "Unnamed candidate"}</span>
-                <span className="dash-role">{it.role || "—"}</span>
-              </div>
-              <div className="dash-meta">
-                <span className={"rec rec-" + it.recommendation}>
-                  {(it.recommendation || "").replace(/_/g, " ")}
-                </span>
-                {it.override && (
-                  <span className={"rec rec-" + it.override}>
-                    → {it.override.replace(/_/g, " ")}
-                  </span>
-                )}
-                <span className="dash-date">
-                  {it.created_at ? new Date(it.created_at * 1000).toLocaleString() : ""}
-                </span>
-              </div>
-            </button>
-          ))}
-        </div>
+        <Dashboard interviews={interviews} onOpen={openInterview} />
       )}
 
-      {view === "room" && !joined && !report && (
-        <div className="setup">
-          <div className="setup-head">
-            <strong>Interview dossier</strong>
-            <span className="setup-sub">
-              Upload the job description and the candidate's résumé as PDFs (or paste the text) —
-              the panel, competency weights, and questions adapt to the role. Optional; leave
-              blank for a generic panel.
-            </span>
-          </div>
-          <div className="setup-cols">
-            <div className="setup-col">
-              <label className="filebtn">
-                <input
-                  type="file"
-                  accept="application/pdf,.pdf"
-                  onChange={(e) => uploadPdf("jd", e.target)}
-                  disabled={joined || uploading === "jd"}
-                />
-                {uploading === "jd"
-                  ? "Reading…"
-                  : jdMeta
-                  ? `📄 ${jdMeta.filename} (${jdMeta.pages}p)`
-                  : "📎 Upload JD PDF"}
-              </label>
-              <textarea
-                className="setup-ta"
-                placeholder="…or paste the job description here"
-                value={jd}
-                onChange={(e) => {
-                  setJd(e.target.value);
-                  setJdMeta(null);
-                }}
-                disabled={joined}
-              />
-            </div>
-            <div className="setup-col">
-              <label className="filebtn">
-                <input
-                  type="file"
-                  accept="application/pdf,.pdf"
-                  onChange={(e) => uploadPdf("resume", e.target)}
-                  disabled={joined || uploading === "resume"}
-                />
-                {uploading === "resume"
-                  ? "Reading…"
-                  : resumeMeta
-                  ? `📄 ${resumeMeta.filename} (${resumeMeta.pages}p)`
-                  : "📎 Upload résumé PDF"}
-              </label>
-              <textarea
-                className="setup-ta"
-                placeholder="…or paste the candidate résumé here"
-                value={resume}
-                onChange={(e) => {
-                  setResume(e.target.value);
-                  setResumeMeta(null);
-                }}
-                disabled={joined}
-              />
-            </div>
-          </div>
-          <div className="setup-actions">
-            <button
-              onClick={previewDossier}
-              disabled={parsing || (!jd.trim() && !resume.trim())}
-            >
-              {parsing ? "Reading…" : "Preview dossier"}
-            </button>
-          </div>
-          {dossier && (
-            <div className="dossier">
-              <div className="dossier-role">
-                {dossier.seniority} {dossier.role}
-                {dossier.candidate_name && (
-                  <span className="dossier-sum"> · candidate: {dossier.candidate_name}</span>
-                )}
-                {dossier.summary && <span className="dossier-sum"> — {dossier.summary}</span>}
-              </div>
-              {(dossier.focus || []).length > 0 && (
-                <div className="dossier-focus">
-                  <span className="dossier-label">Role focus:</span>{" "}
-                  {dossier.focus.map((f, i) => (
-                    <span className="pill" key={i}>
-                      {f}
-                    </span>
-                  ))}
-                </div>
-              )}
-              <div className="dossier-panel">
-                <span className="dossier-label">Panel:</span>{" "}
-                {dossier.panel.map((a) => (
-                  <span className="pill" key={a}>
-                    {(agents.find((g) => g.id === a) || {}).name || a}
-                  </span>
-                ))}
-              </div>
-              {Object.keys(dossier.competency_weights || {}).length > 0 && (
-                <div className="dossier-weights">
-                  <span className="dossier-label">Weights:</span>{" "}
-                  {Object.entries(dossier.competency_weights).map(([k, v]) => (
-                    <span className="pill pill-w" key={k}>
-                      {k} {Math.round(v * 100)}%
-                    </span>
-                  ))}
-                </div>
-              )}
-              {(dossier.resume_claims || []).length > 0 && (
-                <div className="dossier-claims">
-                  <span className="dossier-label">
-                    Résumé claims to verify ({dossier.resume_claims.length}):
-                  </span>
-                  <ul>
-                    {dossier.resume_claims.slice(0, 8).map((c, i) => (
-                      <li key={i}>
-                        {c.text} <em>({c.competency})</em>
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              )}
-            </div>
-          )}
-        </div>
+      {showRoom && !joined && !report && (
+        <SetupDossier
+          jd={jd} setJd={setJd} resume={resume} setResume={setResume}
+          jdMeta={jdMeta} setJdMeta={setJdMeta}
+          resumeMeta={resumeMeta} setResumeMeta={setResumeMeta}
+          uploading={uploading} uploadPdf={uploadPdf}
+          parsing={parsing} previewDossier={previewDossier}
+          dossier={dossier} joined={joined} nameOf={nameOf}
+        />
       )}
 
-      {view === "room" && (
+      {showRoom && !inInterview && (
         <div className="controls">
-          <button className="join" onClick={join} disabled={joined}>
-            Join Interview
+          <button className="btn-primary" onClick={join} disabled={joined || busy}>
+            <i className="ph-fill ph-play" aria-hidden="true" />
+            Join interview
           </button>
-          <button className="interrupt" onClick={interrupt} disabled={!joined}>
-            ✋ Interrupt
+          <button className="btn-flag" onClick={interrupt} disabled={!joined}>
+            <i className="ph ph-hand-palm" aria-hidden="true" />
+            Interrupt
           </button>
-          <button className="finish" onClick={finish} disabled={!joined || scoring}>
-            {scoring ? "Scoring…" : "Finish & score"}
+          <button className="btn-live" onClick={finish} disabled={!joined || scoring}>
+            <i className="ph ph-flag-checkered" aria-hidden="true" />
+            {scoring ? "Scoring" : "Finish and score"}
           </button>
-          <button onClick={leave} disabled={!joined}>
-            Leave
-          </button>
-          <span className="status">{status}</span>
+          <button onClick={leave} disabled={!joined}>Leave</button>
+          <span className="status">
+            {busy && <i className="ph ph-circle-notch spin" aria-hidden="true" />}
+            {status}
+          </span>
         </div>
       )}
 
-      {view === "room" && joined && !talking && geminiTask && (
-        <div className="coding">
-          <div className="coding-head">
-            <strong>🖥️ Live coding task (with Liam)</strong>
-            {geminiActive ? (
-              <button className="ghost" onClick={stopGemini}>End coding</button>
-            ) : (
-              <button className="join" onClick={startCodingGemini}>Share entire screen &amp; start</button>
-            )}
-          </div>
-          <div className="coding-task">{geminiTask}</div>
-          <div className="coding-note">
-            {geminiActive
-              ? "Live with Liam — he can see your screen and hear you. Talk through your code as you go."
-              : "🎧 Use headphones (avoids echo). Share your ENTIRE screen to start — Liam watches you code and talks in real time. A window or tab share is rejected."}
-          </div>
-        </div>
+      {inInterview && (
+        <Stage
+          stageRef={stageRef}
+          agents={agents}
+          speaking={viewSpeaking}
+          thinking={frame ? false : thinking}
+          activePanel={activePanel}
+          finished={finished}
+          agentCap={viewAgentCap}
+          candCap={viewCandCap}
+          elapsed={viewElapsed}
+          turnCount={viewTurn}
+          coverage={viewCoverage}
+          claims={viewClaims}
+          contradictions={viewContra}
+          rewound={!!frame}
+          timeline={
+            <Timeline
+              timeline={timeline}
+              scrubIndex={scrubIndex}
+              onScrub={setScrubIndex}
+              onLive={() => setScrubIndex(null)}
+            />
+          }
+          onInterrupt={interrupt}
+          onFinish={finish}
+          onLeave={leave}
+          scoring={scoring}
+          status={status}
+          busy={busy}
+        />
       )}
 
-      {view === "room" && joined && !talking && codingTask && (
-        <div className="coding">
-          <div className="coding-head">
-            <strong>🖥️ Live coding task</strong>
-            {sharing ? (
-              <button className="ghost" onClick={stopSharing}>Stop sharing</button>
-            ) : (
-              <button className="join" onClick={shareScreen}>Share entire screen</button>
-            )}
-          </div>
-          <div className="coding-task">{codingTask}</div>
-          <div className="coding-note">
-            {sharing
-              ? "Sharing your whole screen — Liam can see your editor and will react to your code."
-              : "You must share your ENTIRE screen (a window or tab will be rejected) so Liam can watch you code. Think out loud as you go."}
-          </div>
-        </div>
+      {showRoom && joined && !talking && (geminiTask || codingTask) && (
+        <CodingRound
+          mode={geminiTask ? "gemini" : "snapshot"}
+          task={geminiTask || codingTask}
+          active={geminiActive}
+          sharing={sharing}
+          screenRead={screenRead}
+          codingName={codingName}
+          onStartGemini={startCodingGemini}
+          onStopGemini={stopGemini}
+          onShareScreen={shareScreen}
+          onStopSharing={stopSharing}
+          status={status}
+        />
+      )}
+
+      {showRoom && joined && codingResult && (
+        <CodingVerdict
+          verdict={codingResult.verdict}
+          summary={codingResult.summary}
+          codingName={codingName}
+        />
       )}
 
       {report && (
-        <div className="report">
-          {(storedId || talking) && (
-            <div className="report-bar">
-              {storedId && (
-                <button className="ghost" onClick={backToList}>← Back to interviews</button>
-              )}
-              {talking && (
-                <button onClick={leave}>Leave voice</button>
-              )}
-              <span className="status">{status}</span>
-            </div>
-          )}
-          <div className="rec-line">
-            <span className={"rec rec-" + report.conclusion.recommendation}>
-              {report.conclusion.recommendation.replace(/_/g, " ")}
-            </span>
-            {overrides.length > 0 && (
-              <span className={"rec rec-" + overrides[overrides.length - 1].decision}>
-                → overridden: {overrides[overrides.length - 1].decision.replace(/_/g, " ")}
-              </span>
-            )}
-          </div>
-          <div className="headline">{report.conclusion.headline}</div>
-
-          <div className="score-grid">
-            {report.scores.map((s) => (
-              <div className="scorecard" key={s.agent_id}>
-                <div className="sc-head">
-                  <span className="sc-name">{nameOf(s.agent_id)}</span>
-                  <span className={"chip " + (s.conviction === "STRONG" ? "strong" : "neutral")}>
-                    {s.conviction}
-                  </span>
-                </div>
-                <div className="sc-role">{titleOf(s.agent_id)}</div>
-                <div className="sc-overall">
-                  {Math.round(s.overall * 100)}<span>/100</span>
-                </div>
-                {Object.entries(s.competency_scores).map(([k, v]) => (
-                  <div className="sc-comp" key={k}>
-                    <span className="sc-comp-name">{k}</span>
-                    <span className="sc-bar">
-                      <span className="sc-fill" style={{ width: `${Math.round(v * 100)}%` }} />
-                    </span>
-                  </div>
-                ))}
-                {s.rationale && <div className="sc-rat">{s.rationale}</div>}
-              </div>
-            ))}
-          </div>
-
-          {report.trajectory && report.trajectory.length >= 2 && (
-            <div className="rep-section">
-              <div className="rep-title">Confidence trajectory (evidence coverage per turn)</div>
-              <ConfidenceChart trajectory={report.trajectory} />
-            </div>
-          )}
-
-          <div className="rep-section">
-            <div className="rep-title">Debate</div>
-            {report.debate.map((d, i) => (
-              <div className="deb" key={i}>
-                <span className={"deb-act " + (d.rejected ? "rej" : d.action.toLowerCase())}>
-                  {d.rejected ? "MOVE→held" : d.action}
-                </span>
-                <b>{nameOf(d.agent_id)}</b>
-                {d.action === "MOVE" && !d.rejected && (
-                  <span className="deb-move">
-                    {" "}{Math.round(d.score_before * 100)}→{Math.round(d.score_after * 100)}
-                  </span>
+        <Report
+          report={report}
+          overrides={overrides}
+          nameOf={nameOf}
+          titleOf={titleOf}
+          fresh={freshReport}
+          topBar={
+            (storedId || talking) && (
+              <div className="report-bar">
+                {storedId && (
+                  <button className="ghost" onClick={backToList}>
+                    <i className="ph ph-arrow-left" aria-hidden="true" />
+                    Back to interviews
+                  </button>
                 )}
-                <span className="deb-text"> {d.statement}</span>
+                {talking && <button onClick={leave}>Leave voice</button>}
+                <span className="status">{status}</span>
               </div>
-            ))}
-          </div>
-
-          <div className="rep-section">
-            <div className="rep-title">Conclusion</div>
-            <p className="rep-reason">{report.conclusion.reasoning}</p>
-            {report.conclusion.unresolved.length > 0 && (
-              <div className="rep-title2">Unresolved — a human should verify</div>
-            )}
-            {report.conclusion.unresolved.map((u, i) => (
-              <div className="unres" key={i}>
-                <span className="unres-item">{u.item}</span>
-                <span className="unres-ev">{u.evidence}</span>
-              </div>
-            ))}
-          </div>
-
-          <div className="rep-hash">🔒 locked record · SHA-256 {report.locked_hash.slice(0, 24)}…</div>
-
-          <div className="rep-section askpanel">
-            <div className="rep-title">Ask the panel</div>
-
-            <div className="voice-join">
-              {!talking ? (
-                <button className="join" onClick={panelJoin}>🎙️ Join to talk to the panel (voice)</button>
-              ) : (
-                <span className="talking-note">
-                  🎙️ In voice with the panel — just speak.
-                  {speaking ? ` ${nameOf(speaking)} is answering…` : ""}
-                </span>
-              )}
-              <span className="voice-or">— or type —</span>
-            </div>
-
-            {qa.map((x, i) => (
-              <div className="qa" key={i}>
-                <div className="qa-q">Q: {x.q}</div>
-                <div className="qa-a"><b>{x.by}:</b> {x.a}</div>
-              </div>
-            ))}
-
-            <div className="ask-row">
-              <select value={askTarget} onChange={(e) => setAskTarget(e.target.value)}>
-                <option value="">Open (host)</option>
-                {report.scores.map((s) => (
-                  <option key={s.agent_id} value={s.agent_id}>{nameOf(s.agent_id)}</option>
-                ))}
-              </select>
-              <input
-                value={askQ}
-                placeholder="e.g. Why did you flag this candidate?"
-                onChange={(e) => setAskQ(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && ask()}
-              />
-              <button onClick={ask} disabled={asking}>{asking ? "…" : "Ask"}</button>
-            </div>
-
-            <div className="ask-sub">Counterfactual — “what if they had said…”</div>
-            <div className="ask-row">
-              <select value={cfAgent} onChange={(e) => setCfAgent(e.target.value)}>
-                <option value="">interviewer…</option>
-                {report.scores.map((s) => (
-                  <option key={s.agent_id} value={s.agent_id}>{nameOf(s.agent_id)}</option>
-                ))}
-              </select>
-              <input className="cf-turn" type="number" value={cfTurn}
-                placeholder="turn" onChange={(e) => setCfTurn(e.target.value)} />
-              <input value={cfHypo} placeholder="hypothetical answer…"
-                onChange={(e) => setCfHypo(e.target.value)} />
-              <button onClick={askCounterfactual} disabled={asking}>Re-score</button>
-            </div>
-
-            <div className="ask-sub">Override the recommendation</div>
-            <div className="ask-row">
-              <select value={ovDecision} onChange={(e) => setOvDecision(e.target.value)}>
-                <option value="">decision…</option>
-                {["PROCEED", "PROCEED_FLAGGED", "INSUFFICIENT_SIGNAL", "DECLINE"].map((d) => (
-                  <option key={d} value={d}>{d.replace(/_/g, " ")}</option>
-                ))}
-              </select>
-              <input value={ovReason} placeholder="reason (logged)"
-                onChange={(e) => setOvReason(e.target.value)} />
-              <button onClick={submitOverride}>Log override</button>
-            </div>
-            {overrides.map((o, i) => (
-              <div className="ovr" key={i}>
-                override: <b>{o.original_recommendation.replace(/_/g, " ")}</b> →{" "}
-                <b>{o.decision.replace(/_/g, " ")}</b> — {o.reason}
-                <span className="ovr-note"> (original recommendation kept)</span>
-              </div>
-            ))}
-          </div>
-        </div>
+            )
+          }
+        >
+          <AskPanel
+            report={report} nameOf={nameOf} talking={talking} speaking={speaking}
+            onJoinVoice={panelJoin}
+            qa={qa}
+            askTarget={askTarget} setAskTarget={setAskTarget}
+            askQ={askQ} setAskQ={setAskQ} asking={asking} onAsk={ask}
+            cfAgent={cfAgent} setCfAgent={setCfAgent}
+            cfTurn={cfTurn} setCfTurn={setCfTurn}
+            cfHypo={cfHypo} setCfHypo={setCfHypo}
+            onCounterfactual={askCounterfactual}
+            ovDecision={ovDecision} setOvDecision={setOvDecision}
+            ovReason={ovReason} setOvReason={setOvReason}
+            onOverride={submitOverride} overrides={overrides}
+          />
+        </Report>
       )}
 
-      {view === "room" && (
+      {showTiles && (
+        <>
+          <PanelTiles
+            agents={agents}
+            speaking={speaking}
+            thinking={thinking}
+            activePanel={activePanel}
+            finished={finished}
+          />
+          <div className="thinkingbar">
+            {thinking ? "the panel is deciding who asks next" : ""}
+          </div>
+          <Captions agentCap={agentCap} candCap={candCap} />
+        </>
+      )}
+
+      {showRoom && !inInterview && (
+        <LiveEvidence
+          coverage={coverage}
+          claims={claims}
+          contradictions={contradictions}
+        />
+      )}
+
+      {showRoom && !inInterview && (
         <div className="howto">
-          🎤 <b>Your mic</b> is for <b>answering</b> — speak, then pause. It won't cut the interviewer
-          off. &nbsp;•&nbsp; ✋ <b>Interrupt</b> is the only way to cut in while someone's talking.
-          &nbsp;•&nbsp; 🧹 AI noise suppression cleans your mic automatically.
-        </div>
-      )}
-
-      {(view === "room" || talking) && (
-      <>
-      <div className="tiles">
-        {agents.map((a, i) => {
-          const done = finished.includes(a.id);
-          const offPanel = !done && activePanel.length > 0 && !activePanel.includes(a.id);
-          const dim = offPanel || done;
-          return (
-            <div
-              key={a.id}
-              className={
-                "tile" +
-                (dim ? " off-panel" : "") +
-                (!dim && speaking === a.id ? " speaking" : !dim && thinking ? " thinking" : "")
-              }
-            >
-              <span className="badge">SPEAKING</span>
-              {done && <span className="offbadge">✓ coding done</span>}
-              {offPanel && <span className="offbadge">not on this panel</span>}
-              <div className="avatar" style={{ background: AVATAR_COLORS[i % AVATAR_COLORS.length] }}>
-                {initials(a.name)}
-              </div>
-              <div className="name">{a.name}</div>
-              <div className="role">{a.title}</div>
-            </div>
-          );
-        })}
-      </div>
-      <div className="thinkingbar">{thinking ? "the panel is deciding who asks next…" : ""}</div>
-
-      <div className="captions">
-        {agentCap && (
-          <div className="cap agent">
-            <div className="who">
-              {agentCap.name} · {agentCap.title}
-            </div>
-            <div className="txt">{agentCap.text}</div>
+          <div className="howto-item">
+            <b>Your mic answers</b>
+            Speak, then pause. It will not cut the interviewer off mid-question.
           </div>
-        )}
-        {candCap && (
-          <div className="cap cand">
-            <div className="who">You said</div>
-            <div className="txt">{candCap}</div>
+          <div className="howto-item">
+            <b>Interrupt cuts in</b>
+            The only way to take the floor while someone else is talking.
           </div>
-        )}
-      </div>
-      </>
-      )}
-
-      {view === "room" && (
-        <div className="debugbar">
-          <button className="ghost" onClick={() => setShowDebug((s) => !s)}>
-            {showDebug ? "▾ Hide panel internals" : "▸ Panel internals (coverage & evidence)"}
-          </button>
-          {contradictions > 0 && (
-            <span className="flag">⚠ {contradictions} contradiction{contradictions > 1 ? "s" : ""}</span>
-          )}
-        </div>
-      )}
-
-      {view === "room" && showDebug && (
-        <div className="debug">
-          <div className="cov">
-            <div className="cov-title">Competency coverage</div>
-            {coverage.length === 0 && <div className="empty">— no evidence yet —</div>}
-            {coverage.map((c) => (
-              <div className="cov-row" key={c.key}>
-                <span className="cov-name">{c.name}</span>
-                <span className="cov-bar">
-                  <span className="cov-fill" style={{ width: `${Math.round(c.value * 100)}%` }} />
-                </span>
-                <span className="cov-val">{Math.round(c.value * 100)}%</span>
-              </div>
-            ))}
-          </div>
-          <div className="claimlist">
-            <div className="cov-title">Evidence ledger ({claims.length})</div>
-            {claims.length === 0 && <div className="empty">— no claims extracted yet —</div>}
-            {claims
-              .slice()
-              .reverse()
-              .map((cl, i) => (
-                <div
-                  className={"claim " + (cl.status === "VAGUE" ? "vague" : "solid") + (cl.contradicts ? " contra" : "")}
-                  key={i}
-                >
-                  <span className="claim-status">{cl.status}</span>
-                  <span className="claim-text">{cl.text}</span>
-                  <span className="claim-meta">
-                    {cl.competency} · {Math.round(cl.strength * 100)}% · turn {cl.turn}
-                    {cl.contradicts ? " · ⚠ contradiction" : ""}
-                  </span>
-                </div>
-              ))}
+          <div className="howto-item">
+            <b>Noise suppression is on</b>
+            Your mic is cleaned automatically. Headphones avoid echo.
           </div>
         </div>
       )}
 
-      <div className="log" ref={logRef}>
-        {logLines.join("\n")}
+      <div className="logbar">
+        <button className="ghost" onClick={() => setShowLog((s) => !s)}>
+          <i className={"ph " + (showLog ? "ph-caret-down" : "ph-caret-right")} aria-hidden="true" />
+          Session log
+        </button>
       </div>
+      {showLog && (
+        <div className="log" ref={logRef}>
+          {logLines.join("\n")}
+        </div>
+      )}
     </div>
   );
 }
