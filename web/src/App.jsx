@@ -26,6 +26,8 @@ export default function App() {
   const [talking, setTalking] = useState(false); // in voice with the panel (Phase 6)
   const [status, setStatus] = useState("Idle.");
   const [busy, setBusy] = useState(false); // status spinner
+  const [micMuted, setMicMuted] = useState(false); // local mic mute (candidate / recruiter)
+  const [liveTranscript, setLiveTranscript] = useState(""); // streamed transcript preview
   const [speaking, setSpeaking] = useState(null); // agent id
   const [thinking, setThinking] = useState(false);
   const [agentCap, setAgentCap] = useState(null); // {name,title,text}
@@ -124,6 +126,8 @@ export default function App() {
 
   const client = useRef(null);
   const mic = useRef(null);
+  const cam = useRef(null);       // candidate camera track (mandatory in interview)
+  const selfRef = useRef(null);   // self-view container
   const ws = useRef(null);
   const denoiser = useRef(null);
 
@@ -148,6 +152,10 @@ export default function App() {
   useEffect(() => { claimsRef.current = claims; }, [claims]);
   useEffect(() => { contraRef.current = contradictions; }, [contradictions]);
   useEffect(() => { elapsedRef.current = elapsed; }, [elapsed]);
+
+  // The live transcript preview is driven by the server's "partial" events (Sarvam
+  // transcribes each phrase as the candidate pauses). Browser speech recognition
+  // can't be used here — Agora holds the mic, so it would get no audio.
 
   // Presenter mode drives a class on <html> so the token overrides reach
   // everything, including elements outside the React root.
@@ -253,9 +261,15 @@ export default function App() {
       } else if (ev.type === "idle") {
         setThinking(false);
         setSpeaking(null);
+      } else if (ev.type === "partial") {
+        setLiveTranscript(ev.text || "");   // streamed transcript preview
       } else if (ev.type === "heard") {
+        setLiveTranscript("");              // final Sarvam transcript takes over
         setCandCap(ev.text);
         pushFrame({ kind: "answer", text: ev.text });
+      } else if (ev.type === "redo") {
+        setLiveTranscript("");
+        setCandCap(null);
       } else if (ev.type === "ledger") {
         setCoverage(ev.coverage || []);
         setClaims(ev.claims || []);
@@ -308,29 +322,20 @@ export default function App() {
   }
 
   async function makeMicTrack() {
-    const track = await AgoraRTC.createMicrophoneAudioTrack({ AEC: true, ANS: true, AGC: true });
-    try {
-      if (!denoiser.current) {
-        denoiser.current = new AIDenoiserExtension({ assetsPath: DENOISER_ASSETS });
-        denoiser.current.onloaderror = (e) => log("denoiser load error: " + e);
-        AgoraRTC.registerExtensions([denoiser.current]);
-      }
-      const proc = denoiser.current.createProcessor();
-      await proc.enable();
-      // NSNG = neural noise suppression. The ESM build doesn't export the mode
-      // enum, but the mode is just the string "NSNG".
-      try {
-        proc.setMode("NSNG");
-      } catch (_) {}
-      track.pipe(proc).pipe(track.processorDestination);
-      log("AI noise suppression (NSNG) enabled");
-    } catch (e) {
-      log("AI denoiser unavailable, using raw mic (" + (e.message || e) + ")");
-    }
+    // Keep AEC (echo), ANS (light noise), AND AGC (auto-gain) — AGC normalizes the
+    // level so the server's RMS gates work across mics/rooms; without it real speech
+    // fell below the threshold and got dropped. The real STT-killer was the heavy AI
+    // denoiser (it mangles phonetics), so that stays OFF. High-quality encoder keeps
+    // the signal to the bot clean.
+    const track = await AgoraRTC.createMicrophoneAudioTrack({
+      AEC: true, ANS: true, AGC: true,
+      encoderConfig: "high_quality",   // 48 kHz mono, higher bitrate
+    });
+    log("mic: high-quality profile, AEC + ANS + AGC on, AI-denoiser off");
     return track;
   }
 
-  async function connectAgora(s) {
+  async function connectAgora(s, withCamera = false) {
     openEvents();
     client.current = AgoraRTC.createClient({ mode: "rtc", codec: "vp8" });
     client.current.on("user-published", async (user, mt) => {
@@ -388,7 +393,19 @@ export default function App() {
     });
     await client.current.join(s.app_id, s.channel, s.token, s.uid);
     mic.current = await makeMicTrack();
-    await client.current.publish([mic.current]);
+    const tracks = [mic.current];
+    if (withCamera) {
+      // Camera is MANDATORY for the interview — if it can't be opened, fail the
+      // join so the candidate must grant access.
+      try {
+        cam.current = await AgoraRTC.createCameraVideoTrack({ encoderConfig: "480p_1" });
+      } catch (e) {
+        throw new Error("CAMERA_REQUIRED: " + (e.message || e));
+      }
+      tracks.push(cam.current);
+      if (selfRef.current) { try { cam.current.play(selfRef.current); } catch { /* noop */ } }
+    }
+    await client.current.publish(tracks);
   }
 
   async function disconnectAgora() {
@@ -397,6 +414,7 @@ export default function App() {
     remoteTrack.current = null;
     if (ws.current) { ws.current.close(); ws.current = null; }
     if (mic.current) { mic.current.stop(); mic.current.close(); mic.current = null; }
+    if (cam.current) { cam.current.stop(); cam.current.close(); cam.current = null; }
     if (client.current) { try { await client.current.leave(); } catch (_) {} client.current = null; }
   }
 
@@ -483,13 +501,20 @@ export default function App() {
       setCandCap(null);
       log(`channel=${s.channel} uid=${s.uid} panel=${(s.panel || []).join(",")}`);
       setStatus("Joining the channel");
-      await connectAgora(s);
+      await connectAgora(s, true);   // camera is mandatory for the interview
       setJoined(true);
+      setMicMuted(false);
       setStatus("Live. The panel will greet you shortly.");
-      log("mic published");
+      log("mic + camera published");
     } catch (e) {
       log("ERROR: " + (e.message || e));
-      setStatus("Failed to start, see the log.");
+      if (String(e.message || e).includes("CAMERA_REQUIRED")) {
+        setStatus("Camera is required for the interview — allow camera access and Join again.");
+      } else {
+        setStatus("Failed to start, see the log.");
+      }
+      try { await disconnectAgora(); } catch { /* cleanup */ } // don't leave a half-joined session
+      await fetch("/session/stop", { method: "POST" }).catch(() => {});
     } finally {
       joining.current = false;
       setBusy(false);
@@ -512,6 +537,7 @@ export default function App() {
       setJoined(true);
       setTalking(true);
       setSpeaking(null);
+      setMicMuted(false);
       setFinished([]);    // the "coding done" greying is interview-only
       setActivePanel([]); // Ask-the-Panel: every interviewer can speak, none greyed
       setStatus("In voice with the panel, just talk.");
@@ -737,6 +763,8 @@ export default function App() {
     setTalking(false);
     setSpeaking(null);
     setThinking(false);
+    setMicMuted(false);
+    clearLive();
     setCodingTask(null);
     setGeminiTask(null);
     setGeminiActive(false);
@@ -850,6 +878,51 @@ export default function App() {
       log(d.interrupted ? "interrupted" : "interrupt: nobody was speaking");
     } catch (e) {
       log("interrupt error: " + (e.message || e));
+    }
+  }
+
+  async function skipIntro() {
+    try {
+      await fetch("/session/interrupt", { method: "POST" }); // cut the host's disclosure
+      setStatus("Skipped the intro.");
+      log("skipped the intro");
+    } catch (e) {
+      log("skip intro error: " + (e.message || e));
+    }
+  }
+
+  function toggleMic() {
+    const next = !micMuted;
+    try { mic.current && mic.current.setMuted(next); } catch { /* noop */ }
+    setMicMuted(next);
+    setStatus(next ? "Microphone muted." : "Microphone on.");
+    log(next ? "🔇 mic muted" : "🎤 mic on");
+  }
+
+  function clearLive() {
+    setLiveTranscript("");
+  }
+
+  async function finishTurn() {
+    try {
+      await fetch("/session/finish-turn", { method: "POST" });
+      clearLive();
+      setStatus("Got it — the panel is responding.");
+      log("done — finalizing my turn");
+    } catch (e) {
+      log("finish-turn error: " + (e.message || e));
+    }
+  }
+
+  async function talkAgain() {
+    try {
+      await fetch("/session/redo", { method: "POST" });
+      clearLive();
+      setCandCap(null);
+      setStatus("Okay — go ahead and say that again.");
+      log("talk again — discarded last answer, listening");
+    } catch (e) {
+      log("redo error: " + (e.message || e));
     }
   }
 
@@ -978,6 +1051,7 @@ export default function App() {
           finished={finished}
           agentCap={viewAgentCap}
           candCap={viewCandCap}
+          liveTranscript={frame ? "" : liveTranscript}
           elapsed={viewElapsed}
           turnCount={viewTurn}
           coverage={viewCoverage}
@@ -995,6 +1069,11 @@ export default function App() {
           onInterrupt={interrupt}
           onFinish={finish}
           onLeave={leave}
+          onDone={finishTurn}
+          onTalkAgain={talkAgain}
+          onToggleMic={toggleMic}
+          onSkipIntro={skipIntro}
+          micMuted={micMuted}
           scoring={scoring}
           status={status}
           busy={busy}
@@ -1050,6 +1129,7 @@ export default function App() {
           <AskPanel
             report={report} nameOf={nameOf} talking={talking} speaking={speaking}
             onJoinVoice={panelJoin}
+            onToggleMic={toggleMic} micMuted={micMuted}
             qa={qa}
             askTarget={askTarget} setAskTarget={setAskTarget}
             askQ={askQ} setAskQ={setAskQ} asking={asking} onAsk={ask}
@@ -1091,16 +1171,18 @@ export default function App() {
       {showRoom && !inInterview && (
         <div className="howto">
           <div className="howto-item">
-            <b>Your mic answers</b>
-            Speak, then pause. It will not cut the interviewer off mid-question.
+            <b>Just speak — pauses are fine</b>
+            The panel waits through your thinking pauses instead of cutting in.
+            Press <b>Done</b> to send immediately if you want.
           </div>
           <div className="howto-item">
-            <b>Interrupt cuts in</b>
-            The only way to take the floor while someone else is talking.
+            <b>Talk again fixes a bad transcript</b>
+            Misheard? Press Talk again to discard it and re-record.
           </div>
           <div className="howto-item">
-            <b>Noise suppression is on</b>
-            Your mic is cleaned automatically. Headphones avoid echo.
+            <b>Interrupt, and mic on/off</b>
+            Talk over an interviewer to cut in (or use Interrupt); mute your mic
+            anytime. Headphones avoid echo.
           </div>
         </div>
       )}
@@ -1116,6 +1198,14 @@ export default function App() {
           {logLines.join("\n")}
         </div>
       )}
+
+      {/* Mandatory candidate camera — self-view, always visible during the interview. */}
+      <div className="selfview" hidden={!(joined && !talking)}>
+        <div className="selfview-frame" ref={selfRef} />
+        <span className="selfview-tag">
+          <i className="ph-fill ph-video-camera" aria-hidden="true" /> You · camera on
+        </span>
+      </div>
     </div>
   );
 }

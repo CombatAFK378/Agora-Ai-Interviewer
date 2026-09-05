@@ -248,8 +248,22 @@ def build_agent_prompt(
     if phase != "LIVE":
         raise NotImplementedError(f"prompt phase {phase!r} lands in a later build phase")
     agent = AGENTS[agent_id]
+    # Lane guard (put LAST so it wins): the résumé + transcript are heavily technical,
+    # which drags every interviewer into implementation questions. Non-technical
+    # interviewers must ask THEIR angle on the same work, not how it was built.
+    lane = ""
+    if agent_id not in ("technical", "coding"):
+        lane = (
+            f"\n\nSTAY IN YOUR LANE — you are the {agent.title}, focused on: {agent.focus}. "
+            "The candidate's work is technical, but asking how it was implemented or how it "
+            "works under the hood is the Technical and Coding interviewers' job, NOT yours. "
+            "Take the SAME project and ask YOUR angle on it — the decisions and trade-offs "
+            "they personally owned, why it mattered and to whom, the outcome, how they made "
+            "or communicated the call. Do not ask about architecture internals, latency, "
+            "chunking, tokens, model weights, or code."
+        )
     system = (agent.persona + (f"\n\n{context}" if context else "")
-              + _INTERVIEW_RULES + (f"\n\n{extra}" if extra else ""))
+              + _INTERVIEW_RULES + lane + (f"\n\n{extra}" if extra else ""))
     return [{"role": "system", "content": system}] + _render_transcript(agent_id, transcript)
 
 
@@ -265,6 +279,23 @@ _CODING_TASK_RULES = (
     "3. Ask them to think out loud.\n"
     "Plain spoken words only — no code, no markdown, no lists. Be concise."
 )
+
+
+_ENDPOINT_SYSTEM = (
+    "You detect end-of-turn in a LIVE spoken interview. The candidate is answering a "
+    "question out loud; the text is real-time speech-to-text, so it's unpunctuated and "
+    "may be rough. Decide whether they have FINISHED their thought and are waiting for "
+    "the panel to respond, OR are still MID-SENTENCE / pausing to think (an incomplete "
+    "clause, trailing off on a connective, clearly about to keep going). When unsure, "
+    "prefer CONTINUING — cutting someone off mid-thought is worse than a short wait. "
+    "Answer with ONE word only: COMPLETE or CONTINUING."
+)
+
+
+def build_endpoint_prompt(transcript_so_far: str) -> list[dict]:
+    """Semantic end-of-turn check for the live interview (§)."""
+    return [{"role": "system", "content": _ENDPOINT_SYSTEM},
+            {"role": "user", "content": f'Candidate, so far: "{transcript_so_far}"'}]
 
 
 def build_coding_task_prompt(context: str = "") -> list[dict]:

@@ -2,7 +2,7 @@ import { agentHue } from "../lib/agents";
 import { prettyEnum, shortTime } from "../lib/format";
 
 export default function AskPanel({
-  report, nameOf, talking, speaking, onJoinVoice,
+  report, nameOf, talking, speaking, onJoinVoice, onToggleMic, micMuted,
   qa, askTarget, setAskTarget, askQ, setAskQ, asking, onAsk,
   cfAgent, setCfAgent, cfTurn, setCfTurn, cfHypo, setCfHypo, onCounterfactual,
   ovDecision, setOvDecision, ovReason, setOvReason, onOverride, overrides,
@@ -23,11 +23,23 @@ export default function AskPanel({
             Join and talk to the panel
           </button>
         ) : (
-          <span className="talking-note">
-            <i className="ph-fill ph-microphone" aria-hidden="true" />
-            In voice with the panel, just speak.
-            {speaking ? ` ${nameOf(speaking)} is answering.` : ""}
-          </span>
+          <>
+            <span className="talking-note">
+              <i className="ph-fill ph-microphone" aria-hidden="true" />
+              In voice with the panel, just speak.
+              {speaking ? ` ${nameOf(speaking)} is answering.` : ""}
+            </span>
+            <button
+              className={"btn-flag" + (micMuted ? " muted" : "")}
+              onClick={onToggleMic}
+              aria-pressed={micMuted}
+              title={micMuted ? "Microphone is off — click to unmute" : "Mute your microphone"}
+            >
+              <i className={"ph-fill " + (micMuted ? "ph-microphone-slash" : "ph-microphone")}
+                 aria-hidden="true" />
+              {micMuted ? "Mic off" : "Mic on"}
+            </button>
+          </>
         )}
         <span className="voice-or">or type</span>
       </div>

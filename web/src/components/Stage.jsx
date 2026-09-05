@@ -12,9 +12,10 @@ const mmss = (s) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
 // you are actually reading.
 export default function Stage({
   stageRef, agents, speaking, thinking, activePanel, finished,
-  agentCap, candCap, elapsed, turnCount,
+  agentCap, candCap, liveTranscript, elapsed, turnCount,
   coverage, claims, contradictions,
-  onInterrupt, onFinish, onLeave, scoring, status, busy,
+  onInterrupt, onFinish, onLeave, onDone, onTalkAgain, onToggleMic, onSkipIntro, micMuted,
+  scoring, status, busy,
   rewound, timeline,
 }) {
   const live = agents.filter(
@@ -47,6 +48,30 @@ export default function Stage({
           </span>
         )}
         <div className="stage-actions">
+          {speaking === "orchestrator" && (
+            <button className="btn-primary" onClick={onSkipIntro} title="Skip the host's disclosure">
+              <i className="ph-fill ph-fast-forward" aria-hidden="true" />
+              Skip intro
+            </button>
+          )}
+          <button
+            className={"btn-flag" + (micMuted ? " muted" : "")}
+            onClick={onToggleMic}
+            aria-pressed={micMuted}
+            title={micMuted ? "Microphone is off — click to unmute" : "Mute your microphone"}
+          >
+            <i className={"ph-fill " + (micMuted ? "ph-microphone-slash" : "ph-microphone")}
+               aria-hidden="true" />
+            {micMuted ? "Mic off" : "Mic on"}
+          </button>
+          <button className="btn-primary" onClick={onDone} title="I'm finished answering — go ahead">
+            <i className="ph-fill ph-check" aria-hidden="true" />
+            Done
+          </button>
+          <button className="ghost" onClick={onTalkAgain} title="Wrong transcript? Discard and speak again">
+            <i className="ph ph-arrow-counter-clockwise" aria-hidden="true" />
+            Talk again
+          </button>
           <button className="btn-flag" onClick={onInterrupt}>
             <i className="ph ph-hand-palm" aria-hidden="true" />
             Interrupt
@@ -58,6 +83,14 @@ export default function Stage({
           <button className="ghost" onClick={onLeave}>Leave</button>
         </div>
       </div>
+
+      {!rewound && (
+        <div className="stage-hint">
+          <i className="ph-fill ph-microphone" aria-hidden="true" />
+          Just speak — pause and think freely; the panel waits through your pauses.
+          Press <b>Done</b> to send right away, or <b>Talk again</b> if it misheard you.
+        </div>
+      )}
 
       <div className="seats">
         {live.map((a) => {
@@ -124,14 +157,23 @@ export default function Stage({
             </div>
           )}
 
-          {candCap && (
+          {liveTranscript && !rewound && (
+            <div className="said you live">
+              <div className="said-who">
+                You <span className="live-tag">live — press Done when finished</span>
+              </div>
+              <p className="said-text">{liveTranscript}</p>
+            </div>
+          )}
+
+          {candCap && !liveTranscript && (
             <div className="said you">
               <div className="said-who">You</div>
               <p className="said-text">{candCap}</p>
             </div>
           )}
 
-          {!agentCap && !candCap && !thinking && (
+          {!agentCap && !candCap && !liveTranscript && !thinking && (
             <p className="empty">Waiting for the panel to open.</p>
           )}
         </div>

@@ -22,8 +22,13 @@ from vad import SileroVAD
 import stt
 import tts
 
-from pipeline import (MIN_SPEECH_RMS, PENDING_MAX_SECS, PENDING_TIMEOUT_SECS,
-                      _is_filler, _rms)
+from pipeline import MIN_SPEECH_RMS, _is_filler, _rms
+
+# Ask-the-Panel (recruiter) keeps automatic turn-taking (Smart Turn + a short
+# timeout) — the manual "Done" model is candidate-only. Own constants so the
+# interview pipeline can change its turn logic without affecting this.
+PENDING_MAX_SECS = 30.0
+PENDING_TIMEOUT_SECS = 4.0
 from shared import ask_panel, prompts, store
 from shared.config import Settings
 from shared.models import REC_DECLINE, REC_PROCEED, REC_PROCEED_FLAGGED
@@ -267,10 +272,12 @@ class AskPipeline:
                             "panel's original call stays on record.")
                 return
             target = self._resolve_target(text)
+            logger.info("ask: routing to %s", target or "open/orchestrator")
             if target:
                 ans = ask_panel.answer(self.record, text, mode="addressed", target=target)
             else:
                 ans = ask_panel.answer(self.record, text)   # open → Orchestrator + override tool
+            logger.info("ask: %s answers: %r", ans.answered_by, (ans.answer or "")[:160])
             if ans.override is not None:
                 self._emit({"type": "override", "override": ans.override.model_dump()})
             self._speak(ans.answered_by, ans.answer)

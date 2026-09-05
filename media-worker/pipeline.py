@@ -46,19 +46,45 @@ from shared.models import AuditEvent, Dossier, TranscriptTurn
 
 logger = logging.getLogger(__name__)
 
-PENDING_MAX_SECS = 30.0
-# After Smart Turn says "not done yet", how long the candidate may stay silent
-# (thinking, gathering words) before we finalize the turn anyway. Short values
-# cut people off mid-thought; this is generous on purpose.
-PENDING_TIMEOUT_SECS = 5.0
-# When Smart Turn is CONFIDENT the candidate is mid-sentence (p_complete below
-# this), wait this much longer before finalizing — a longer thinking pause on an
-# obviously unfinished sentence shouldn't hand the floor to the panel.
-PENDING_MIDSENTENCE_PROB = 0.20
-PENDING_TIMEOUT_LONG_SECS = 10.0
+# Hybrid turn-taking (interruptible, but generous so long-thinkers aren't cut off):
+# after a pause we DON'T commit immediately — we start a short "commit timer" and
+# any resumed speech resets it, so a false endpoint just extends the turn instead of
+# handing the floor away. The "Done" button is an accelerator that commits now.
+# Interviews are monologue-shaped: people pause 1.5–3s mid-answer to think, and
+# Smart Turn can't tell "end of sentence" from "end of answer" (it returns high
+# confidence mid-thought). So the auto-commit wait is generous across the board —
+# enough to bridge a thinking pause — and any resumed speech resets it. The Done
+# button is the fast path for candidates who want an immediate reply.
+# Semantic turn detection (the reliable signal): after each phrase, a fast LLM reads
+# the transcript and says whether the ANSWER is complete or the candidate is still
+# mid-thought. That decision refines the commit timer below.
+SEMANTIC_COMPLETE_GRACE = 1.5  # LLM says "complete" → reply after this brief guard
+TURN_TIMEOUT_BASE = 4.0       # provisional wait before the semantic check lands
+TURN_TIMEOUT_LONG = 7.0       # LLM says "still going" → hold this long (resets on resume)
+PENDING_MAX_SECS = 180.0      # safety cap on one answer's buffered audio
 OPENER_DELAY_SECS = 1.5
 MIN_SPEECH_RMS = 350.0
 BARGEIN_GRACE_SECS = 1.0
+# Barge-in only on LOUD, sustained speech — a door slam, cough, keyboard or echo
+# stays below this and won't cut the interviewer off mid-question (int16 RMS).
+BARGEIN_MIN_RMS = 1300.0
+
+# Trailing words that mean the speaker is still holding the floor — a turn ending
+# on one of these is treated as incomplete (wait longer) even if the audio sounds
+# done. Fillers, conjunctions, and obvious dangling function words.
+_HOLD_TAIL = {
+    "um", "umm", "uh", "uhh", "er", "erm", "hmm", "mmm", "like", "so", "and",
+    "but", "because", "cause", "or", "the", "a", "an", "to", "of", "for", "with",
+    "that", "if", "when", "my", "is", "are", "was", "in", "on", "at", "i", "we",
+    "they", "it", "then", "as", "by",
+}
+
+
+def _tail_is_incomplete(text: str) -> bool:
+    """True if the transcript so far ends on a filler / conjunction / dangling word,
+    signalling the candidate is mid-thought and more is coming."""
+    words = re.findall(r"[a-z']+", (text or "").lower())
+    return bool(words) and words[-1] in _HOLD_TAIL
 # Question generation reads the recent thread (the full transcript is still kept
 # for scoring/dashboard). Larger than the bid window so questions stay coherent.
 QUESTION_CONTEXT_TURNS = 16
@@ -151,7 +177,14 @@ class InterviewPipeline:
         self.on_event: Optional[Callable[[dict], None]] = None
 
         self._pending = bytearray()
-        self._pending_since: float | None = None
+        self._commit_at: float | None = None  # when to commit the buffered turn (None = still open)
+        self._recent_rms = 0.0                # decaying peak loudness, for barge-in gating
+        self._finish_requested = False       # candidate pressed "Done" → finalize now
+        self._cancel_current_reply = False   # candidate pressed "Talk again" → drop this reply
+        # Live transcript preview: each VAD phrase is transcribed as the candidate
+        # pauses and streamed to the UI, so they can verify before pressing Done.
+        self._partial_q: queue.Queue = queue.Queue()
+        self._live_text = ""
 
         self._reply_lock = threading.Lock()
         self._replying = False
@@ -162,12 +195,15 @@ class InterviewPipeline:
 
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True, name="pipeline")
+        self._partial_thread = threading.Thread(target=self._partial_worker, daemon=True,
+                                                name="partial-stt")
 
     # ---- lifecycle ---------------------------------------------------------
 
     def start(self):
         self._stop.clear()
         self._thread.start()
+        self._partial_thread.start()
         logger.info(
             "InterviewPipeline running (panel=%s, smart_turn=%s, bargein=%s)",
             ",".join(self.panel), "on" if self.smart_turn.enabled else "off",
@@ -204,6 +240,35 @@ class InterviewPipeline:
         self._handle_interruption()
         return True
 
+    def finish_turn(self) -> bool:
+        """Candidate pressed 'Done': finalize the current utterance immediately,
+        without waiting for Smart Turn / the pending timeout."""
+        logger.info("candidate pressed Done — finalizing turn now")
+        self._finish_requested = True
+        return True
+
+    def request_redo(self) -> bool:
+        """Candidate pressed 'Talk again' (e.g. the transcript was wrong): cut off any
+        panel reply in progress, drop the misheard turn (and any reply to it) from the
+        transcript, and listen again."""
+        self.session.interrupt()             # stop any interviewer audio now
+        if self._replying:
+            self._cancel_current_reply = True  # abort the reply if it hasn't spoken yet
+        removed = 0
+        with self._tx_lock:
+            while self.transcript and self.transcript[-1].speaker != "candidate":
+                self.transcript.pop(); removed += 1
+            if self.transcript and self.transcript[-1].speaker == "candidate":
+                self.transcript.pop(); removed += 1
+        self._pending = bytearray()
+        self._commit_at = None
+        self._finish_requested = False
+        self._reset_live_preview()
+        self._emit({"type": "partial", "text": ""})
+        self._emit({"type": "redo", "removed": removed})
+        logger.info("candidate pressed Talk again — dropped %d turn(s); listening again", removed)
+        return True
+
     def on_candidate_joined(self, user_id=None):
         """Cold start (§5): host disclosure + panel intro, then the HM opener."""
         with self._reply_lock:
@@ -221,6 +286,9 @@ class InterviewPipeline:
             except queue.Empty:
                 self._check_pending_timeout()
                 continue
+            # Decaying peak loudness, so barge-in can require a genuinely loud voice
+            # rather than quiet background noise / post-AEC echo.
+            self._recent_rms = max(_rms(pcm), self._recent_rms * 0.85)
             # Half-duplex: ignore the mic entirely while an agent is speaking so
             # its own voice can't become a phantom turn / false barge-in.
             if not self.allow_bargein and self.session.is_speaking():
@@ -232,37 +300,114 @@ class InterviewPipeline:
                 self._check_pending_timeout()
 
     def _on_vad_utterance(self, utterance: bytes):
+        # A phrase just ended (a pause). Accumulate it, stream a preview, and (re)set
+        # the commit timer. We DON'T commit here on a pause — we start a timer, and
+        # any resumed speech reaches this method again and pushes the timer out, so a
+        # thinking pause or a premature endpoint just extends the turn.
         combined = bytes(self._pending) + utterance
-        self._pending_since = None
+        self._pending = bytearray(combined)
+        # Transcribe this phrase (preview) AND run the semantic end-of-turn check on
+        # the updated transcript — both happen in the partial worker so the audio loop
+        # never blocks. That check refines the commit timer below.
+        self._partial_q.put(bytes(utterance))
         capped = len(combined) >= int(PENDING_MAX_SECS * self.sample_rate * 2)
-        if capped or self.smart_turn.is_complete(combined):
-            self._pending = bytearray()
-            self._process_candidate_turn(combined)
-        else:
-            logger.info("Smart Turn: incomplete, keep listening")
-            self._pending = bytearray(combined)
-            self._pending_since = time.monotonic()
+        if self._finish_requested or capped:
+            self._commit_turn()
+            return
+        # Provisional generous timer until the semantic check lands (~1s later); it
+        # will pull this in if the answer is complete, or push it out if not.
+        self._commit_at = time.monotonic() + TURN_TIMEOUT_BASE
 
     def _check_pending_timeout(self):
-        if not self._pending or self._pending_since is None:
+        # Commit the buffered turn when its timer elapses (the candidate didn't resume)
+        # or when Done was pressed. If Done is pressed while the buffer is still empty
+        # (the last phrase hasn't landed yet), _on_vad_utterance commits it on arrival.
+        if not self._pending:
             return
-        # When Smart Turn was CONFIDENT the candidate is mid-sentence (very low
-        # p_complete — e.g. they trailed off "…which is our"), give them much longer
-        # to gather their thoughts before we finalise. Otherwise a normal thinking
-        # pause cuts them off and the panel jumps in. A clearer end gets the short
-        # timeout so the panel stays responsive.
-        timeout = (PENDING_TIMEOUT_LONG_SECS
-                   if self.smart_turn.last_prob < PENDING_MIDSENTENCE_PROB
-                   else PENDING_TIMEOUT_SECS)
-        if time.monotonic() - self._pending_since >= timeout:
-            logger.info("pending utterance timed out (%.1fs, p=%.3f); finalising",
-                        timeout, self.smart_turn.last_prob)
-            pcm = bytes(self._pending)
-            self._pending = bytearray()
-            self._pending_since = None
-            self._process_candidate_turn(pcm)
+        if self._finish_requested or (self._commit_at is not None
+                                      and time.monotonic() >= self._commit_at):
+            self._commit_turn()
+
+    def _commit_turn(self):
+        self._finish_requested = False
+        self._commit_at = None
+        pcm = bytes(self._pending)
+        self._pending = bytearray()
+        self._process_candidate_turn(pcm)
+
+    def _partial_worker(self):
+        """Transcribe each buffered phrase as it lands and stream the growing preview
+        to the UI, so the candidate can read their answer back before pressing Done."""
+        while not self._stop.is_set():
+            try:
+                seg = self._partial_q.get(timeout=0.3)
+            except queue.Empty:
+                continue
+            if seg is None:            # sentinel: turn finalized/reset — clear preview
+                self._live_text = ""
+                continue
+            if _rms(seg) < MIN_SPEECH_RMS:
+                continue
+            try:
+                text = stt.transcribe(seg, self.settings.sarvam_api_key, self.sample_rate)
+            except Exception:
+                logger.warning("partial STT failed; skipping preview segment")
+                continue
+            if not text or self._finish_requested:
+                continue
+            self._live_text = (self._live_text + " " + text).strip()
+            logger.info("partial STT (+%r) → preview: %r", text, self._live_text[-120:])
+            self._emit({"type": "partial", "text": self._live_text})
+            # Semantic end-of-turn: only while this turn is still open (not already
+            # committed / no Done pressed). Refines the commit timer set in _on_vad.
+            if self._pending and self._commit_at is not None and not self._finish_requested:
+                self._apply_semantic(self._live_text)
+
+    def _apply_semantic(self, text: str):
+        done = self._semantic_check(text)
+        if not (self._pending and self._commit_at is not None):
+            return   # turn committed while we were thinking — ignore
+        if done is True:
+            self._commit_at = time.monotonic() + SEMANTIC_COMPLETE_GRACE
+            logger.info("semantic: COMPLETE → reply in %.1fs (unless they resume)", SEMANTIC_COMPLETE_GRACE)
+        elif done is False:
+            self._commit_at = time.monotonic() + TURN_TIMEOUT_LONG
+            logger.info("semantic: CONTINUING → holding the floor (%.1fs)", TURN_TIMEOUT_LONG)
+
+    def _semantic_check(self, text: str) -> bool | None:
+        """Ask the fast model whether the answer is finished. True=complete,
+        False=still going, None=couldn't decide (fall back to the timer)."""
+        if len(text.split()) < 3:
+            return None
+        try:
+            raw = llm_router.chat(
+                prompts.build_endpoint_prompt(text[-600:]),
+                model=self.settings.llm_fast_model, max_tokens=4, temperature=0.0,
+                reasoning_effort="low", use_fallback_chain=False, retries=0, timeout=6,
+            )
+            up = raw.upper()
+            if "CONTINU" in up:
+                return False
+            if "COMPLETE" in up:
+                return True
+            return None
+        except Exception:
+            logger.warning("semantic endpoint check failed; using timer")
+            return None
+
+    def _reset_live_preview(self):
+        """Drop any queued preview segments and clear the running preview text."""
+        try:
+            while True:
+                self._partial_q.get_nowait()
+        except queue.Empty:
+            pass
+        self._live_text = ""
+        self._partial_q.put(None)   # tell the worker to clear its accumulator
 
     def _process_candidate_turn(self, pcm: bytes):
+        self._cancel_current_reply = False   # fresh turn — don't inherit a stale redo
+        self._reset_live_preview()           # this answer is finalized; clear the preview
         secs = len(pcm) / (self.sample_rate * 2)
         rms = _rms(pcm)
         if rms < MIN_SPEECH_RMS:
@@ -355,6 +500,8 @@ class InterviewPipeline:
 
         self._emit({"type": "thinking"})
         bids = orchestrator.collect_bids(self.panel, snapshot, self.contexts)
+        logger.info("bids: %s", " | ".join(
+            f"{a}={bids[a].interest:.2f}({bids[a].reason})" for a in self.panel if a in bids))
 
         # Steps 5 and 10 are the same call (§4): the bids also carry the claims
         # each interviewer noticed. Write them to the ledger, then refresh the
@@ -395,6 +542,10 @@ class InterviewPipeline:
         ) if decision.all_low else ""
         text = self._generate_question(decision.winner, extra=pivot)
         if not text:
+            return
+        if self._cancel_current_reply:   # candidate hit "Talk again" mid-generation
+            self._cancel_current_reply = False
+            logger.info("reply cancelled (redo) before speaking")
             return
         self._speak_and_wait(decision.winner, text)
         self.floor.record(decision.winner)
@@ -707,10 +858,19 @@ class InterviewPipeline:
     # ---- interruption ------------------------------------------------------
 
     def _on_speech_start(self):
+        # Candidate started talking over the interviewer. Only treat it as a real
+        # barge-in if it's LOUD and sustained (the VAD already required ~750ms of
+        # speech) — a cough, keyboard, door or quiet echo stays below the RMS gate
+        # and won't cut the question off.
         if not self.session.is_speaking():
             return
         if self.session.speaking_elapsed() < BARGEIN_GRACE_SECS:
             return
+        if self._recent_rms < BARGEIN_MIN_RMS:
+            logger.info("barge-in ignored: too quiet (rms=%.0f < %.0f) — likely noise/echo",
+                        self._recent_rms, BARGEIN_MIN_RMS)
+            return
+        logger.info("barge-in: candidate spoke over the interviewer (rms=%.0f)", self._recent_rms)
         self._handle_interruption()
 
     def _handle_interruption(self):

@@ -248,6 +248,10 @@ button:disabled { opacity: 0.38; cursor: not-allowed; }
 
 .btn-flag { background: var(--flag-soft); border-color: var(--flag-line); color: var(--flag); }
 .btn-flag:hover:not(:disabled) { background: rgba(224, 163, 64, 0.2); border-color: var(--flag); }
+/* Muted mic: clear "off" state (red-ish), distinct from the amber flag buttons. */
+.btn-flag.muted { background: rgba(220, 80, 80, 0.16); border-color: rgba(220, 80, 80, 0.6);
+                  color: #f0a3a3; }
+.btn-flag.muted:hover:not(:disabled) { background: rgba(220, 80, 80, 0.26); }
 
 button.ghost {
   background: transparent; border-color: var(--line);
@@ -1322,3 +1326,28 @@ button.ghost:hover:not(:disabled) { color: var(--text); border-color: var(--line
   .lp-bid-fill { transform: scaleX(1); transition: none; }
   .lp-claims .claim { opacity: 1; transform: none; transition: none; }
 }
+
+/* Manual turn-taking hint: the candidate must press Done to send their answer. */
+.stage-hint { display:flex; align-items:center; gap:8px; margin:10px 2px 0;
+              font-size:.82rem; color:var(--dim); line-height:1.4; }
+.stage-hint b { color:var(--text); }
+.stage-hint i { color:var(--live, #46d19e); }
+
+/* Live caption preview (browser speech recognition) while the candidate answers. */
+.said.you.live { opacity: 0.95; border-style: dashed; }
+.said.you.live .said-text { color: var(--dim); }
+.live-tag { margin-left: 8px; font-size: .68rem; font-weight: 600; letter-spacing: .3px;
+            color: var(--live, #46d19e); text-transform: uppercase; }
+.said.you.live .said-who { display: inline-flex; align-items: center; }
+
+/* Mandatory candidate camera — floating self-view. */
+.selfview { position: fixed; right: 18px; bottom: 18px; width: 220px; z-index: 50;
+            border-radius: 12px; overflow: hidden; border: 1px solid var(--line);
+            background: #000; box-shadow: 0 8px 30px rgba(0,0,0,.45); }
+.selfview[hidden] { display: none !important; }
+.selfview-frame { width: 100%; aspect-ratio: 4 / 3; background: #000; }
+.selfview-frame video { width: 100% !important; height: 100% !important; object-fit: cover; transform: scaleX(-1); }
+.selfview-tag { position: absolute; left: 8px; bottom: 8px; font-size: .68rem; font-weight: 600;
+                color: #fff; background: rgba(0,0,0,.55); padding: 2px 8px; border-radius: 999px;
+                display: inline-flex; align-items: center; gap: 5px; }
+.selfview-tag i { color: var(--live, #46d19e); }

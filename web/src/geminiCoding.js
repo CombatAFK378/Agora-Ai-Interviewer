@@ -10,10 +10,11 @@ const FINISH_TOOL = {
       name: "finish_coding",
       description:
         "End the live coding round. Call this when the candidate has finished, " +
-        "solved it, given up, or wants to move on (verdict 'done'), OR when you " +
-        "actually SEE an AI assistant/chatbot open on their screen or a full " +
-        "solution pasted in (verdict 'cheating'). Do not call it in the first " +
-        "couple of minutes unless there is clear cheating.",
+        "solved it, given up, or wants to move on (verdict 'done'), OR when they are " +
+        "UNMISTAKABLY USING an AI assistant for this task — a real chat conversation is " +
+        "the focused window with the problem/solution in it, or they're copying a " +
+        "generated solution (verdict 'cheating'). Background AI tabs, shortcut tiles, " +
+        "or the browser's own 'Ask Gemini'/'AI Mode' buttons are NOT cheating.",
       parameters: {
         type: Type.OBJECT,
         properties: {
@@ -41,20 +42,41 @@ function systemInstruction(task) {
     "are running ONE live coding exercise and you can SEE the candidate's screen and " +
     "HEAR them speak.\n\n" +
     `THE TASK: ${task}\n\n` +
-    "Behave like a real engineer looking over their shoulder. Greet them, restate " +
-    "the task in one short line, then WATCH and coach: react to what they actually " +
-    "type ('nice, you set up the hashmap'), give a small nudge if they're stuck, and " +
-    "answer their questions. Keep every spoken reply to 1-2 short sentences.\n\n" +
-    "POLICY: they may use Google or official docs for SYNTAX, but NOT AI assistants " +
-    "(ChatGPT, Claude, Copilot, Gemini, Perplexity), and the core logic must be their " +
-    "own. Their own code that imports or calls AI libraries (openai, langchain, etc.) " +
-    "is NORMAL work — that is NOT cheating.\n\n" +
-    "Give them a few minutes to actually work. When the round is genuinely over, or if " +
-    "you clearly see an AI assistant open on their screen, FIRST say your closing line " +
-    "OUT LOUD (e.g. 'I can see ChatGPT open there — that's not allowed for the logic, so " +
-    "that's my read on this round; I'll hand back to the panel.'), and THEN call the " +
-    "finish_coding function with the verdict and a short summary. Never end silently — " +
-    "always speak before you call the function."
+    "Behave like a real engineer looking over their shoulder. Greet them and restate " +
+    "the task in one short line. Then WATCH and coach, but describe ONLY what is " +
+    "GENUINELY visible on their screen right now — never invent or assume progress. If " +
+    "there is no code editor open, or no code written yet, do NOT pretend they're " +
+    "coding; instead tell them to open an editor and start (e.g. 'I don't see an editor " +
+    "yet — open one and start writing the function'). Only when you actually see code " +
+    "should you react to it or nudge them. Keep every spoken reply to 1-2 short " +
+    "sentences.\n\n" +
+    "POLICY: they may use Google or official docs for SYNTAX. The core logic must be " +
+    "their own.\n\n" +
+    "CHEATING has a HIGH bar — it means they are ACTIVELY USING an AI assistant to get " +
+    "the answer: an AI chat (ChatGPT, Claude, Copilot, Perplexity, Gemini) is the FOCUSED " +
+    "foreground window with THIS coding problem or its solution typed/visible in it, or " +
+    "they are clearly copying a generated solution into their editor. Be strict — do NOT " +
+    "flag any of these normal things:\n" +
+    "- AI-tool TABS merely open in the browser tab strip, or shortcut tiles / bookmarks " +
+    "for Claude, Perplexity, ChatGPT on a new-tab page.\n" +
+    "- The browser's own built-in buttons like 'Ask Gemini', 'AI Mode', or a Copilot " +
+    "icon — those are part of the browser, not something the candidate is using.\n" +
+    "- Their own code importing or calling AI libraries (openai, langchain, etc.).\n" +
+    "- Other apps or tabs in the background.\n" +
+    "Only flag when an AI assistant is UNMISTAKABLY IN USE for this task (a real chat " +
+    "conversation about the problem is open and focused). If you are not sure it's being " +
+    "used, do NOT flag — assume innocent.\n\n" +
+    "Give them a few minutes to actually work. Two ways the round ends:\n" +
+    "- If you clearly see them USING an AI assistant (as defined above): say EXACTLY " +
+    "this kind of line and nothing else — 'I can see [ChatGPT/Claude] open there — that's " +
+    "not allowed, so that's my read on this round; I'll hand it back to the panel.' — " +
+    "then IMMEDIATELY call finish_coding with verdict 'cheating'.\n" +
+    "- If they finish, solve it, or give up: briefly say how it went, then call " +
+    "finish_coding with verdict 'done'.\n" +
+    "The function call is what ends the round.\n\n" +
+    "CRITICAL: say the closing line ONCE and call finish_coding right away. Do NOT keep " +
+    "repeating yourself, and do NOT drift into unrelated commentary — one observation, " +
+    "then the function call."
   );
 }
 
@@ -310,8 +332,10 @@ export async function startGeminiCoding({
   log("screen frames streaming every 1.5s");
 
   // Proactive "watch check": while the candidate codes silently there's no speech
-  // to trigger a turn, so Gemini wouldn't look at the screen. Nudge it periodically
-  // to assess the current frame — flag cheating immediately, else a brief comment.
+  // to trigger a turn, so Gemini wouldn't look at the screen. Nudge it gently for a
+  // progress comment. NOTE: cheating handling lives ONLY in the system instruction —
+  // re-asking about it every tick made Liam narrate "I see Claude" on a loop instead
+  // of calling finish_coding. So this nudge is purely about progress.
   watchTimer = setInterval(() => {
     if (finished) return;
     try {
@@ -320,18 +344,23 @@ export async function startGeminiCoding({
           role: "user",
           parts: [{
             text:
-              "[watch check — I may be coding silently] Look at my screen RIGHT NOW. " +
-              "If an AI assistant/chatbot (ChatGPT, Claude, Copilot, Gemini) is open, or a " +
-              "full solution is pasted in, say so and call finish_coding with cheating " +
-              "immediately. Otherwise give ONE short comment on my progress or a nudge if " +
-              "I seem stuck — keep it to a single sentence.",
+              "[watch check — I may be coding silently] Glance at my screen. If I have " +
+              "code visible, react to what's ACTUALLY there or nudge me if I'm stuck. If " +
+              "there's no editor or code yet, remind me to open one and start. One short " +
+              "sentence — describe only what you truly see, never invent progress, and " +
+              "don't repeat something you've already said.",
           }],
         }],
         turnComplete: true,
       });
     } catch { /* session may be closing */ }
-  }, 12000);
-  log("watch-check nudges every 12s");
+  }, 15000);
+  log("watch-check nudges every 15s");
+
+  // Hard backstop against any loop: if the round never ends on its own, close it out
+  // after CODING_MAX_MS so Liam can't narrate forever.
+  const CODING_MAX_MS = 4 * 60 * 1000;
+  setTimeout(() => { if (!finished) { log("coding round hit time cap — ending"); finish("done", "(coding round timed out)"); } }, CODING_MAX_MS);
 
   return { stop: () => finish("done", "(coding round ended)") };
 }

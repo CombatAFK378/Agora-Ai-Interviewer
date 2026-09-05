@@ -15,7 +15,10 @@ speaker signals to the UI over a WebSocket (our stand-in for Agora RTM).
 import asyncio
 import io
 import logging
+import logging.handlers
 import os
+import shutil
+import time
 import uuid
 
 from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
@@ -31,8 +34,60 @@ from agora_session import AgoraSession
 from pipeline import InterviewPipeline
 from ask_pipeline import AskPipeline
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+_LOG_FMT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+logging.basicConfig(level=logging.INFO, format=_LOG_FMT)
 logger = logging.getLogger("media-worker")
+
+# Mirror ALL backend logs to data/server.log (mounted volume) so the full picture —
+# every module, every turn, STT, bids, floor, scoring, coding, errors + tracebacks
+# — is inspectable in a file, not only the Docker terminal. Pairs with client.log.
+try:
+    _log_dir = get_settings().data_dir
+    os.makedirs(_log_dir, exist_ok=True)
+    # Fresh logs every container start: wipe the previous run's files and per-session
+    # folders so each `docker compose up` begins clean (no accumulation).
+    shutil.rmtree(os.path.join(_log_dir, "logs"), ignore_errors=True)
+    for _name in ("server.log", "client.log"):
+        try:
+            open(os.path.join(_log_dir, _name), "w", encoding="utf-8").close()
+        except Exception:
+            pass
+    # mode="w" so this handler also starts the file fresh on boot.
+    _fh = logging.handlers.RotatingFileHandler(
+        os.path.join(_log_dir, "server.log"), mode="w",
+        maxBytes=5_000_000, backupCount=3, encoding="utf-8")
+    _fh.setLevel(logging.INFO)
+    _fh.setFormatter(logging.Formatter(_LOG_FMT))
+    logging.getLogger().addHandler(_fh)      # attach to root → captures every module
+    logger.info("logs reset for this run → %s (server.log, client.log, logs/)", _log_dir)
+except Exception:
+    logger.exception("could not set up server.log file handler")
+
+# Per-session logs: each interview run gets its own folder under data/logs/ with its
+# own client.log + server.log, so a single run is easy to isolate for debugging (the
+# top-level server.log/client.log stay as a rolling all-sessions catch-all).
+_session_log_dir: str | None = None
+_session_handler: logging.Handler | None = None
+
+
+def _begin_session_logs(interview_id: str):
+    global _session_log_dir, _session_handler
+    try:
+        tag = f"{time.strftime('%Y%m%d_%H%M%S')}_{interview_id}"
+        d = os.path.join(get_settings().data_dir, "logs", tag)
+        os.makedirs(d, exist_ok=True)
+        _session_log_dir = d
+        if _session_handler is not None:        # detach the previous run's handler
+            logging.getLogger().removeHandler(_session_handler)
+            _session_handler.close()
+        h = logging.FileHandler(os.path.join(d, "server.log"), encoding="utf-8")
+        h.setLevel(logging.INFO)
+        h.setFormatter(logging.Formatter(_LOG_FMT))
+        logging.getLogger().addHandler(h)
+        _session_handler = h
+        logger.info("=== new session %s — logs in %s ===", interview_id, d)
+    except Exception:
+        logger.exception("could not start per-session logs")
 
 BOT_UID = 1
 CANDIDATE_UID = 100
@@ -227,6 +282,7 @@ def session_start(req: StartRequest | None = None):
         logger.info("dossier: role=%r panel=%s", _dossier.role, _dossier.panel)
 
     interview_id = uuid.uuid4().hex[:12]
+    _begin_session_logs(interview_id)   # fresh per-run log folder
     channel = f"iv-{interview_id[:8]}"
     sample_rate = settings.audio_sample_rate
 
@@ -294,12 +350,17 @@ class ClientLogRequest(BaseModel):
 
 @app.post("/client-log")
 def client_log(req: ClientLogRequest):
-    """Mirror the browser's on-screen log into data/client.log so it's inspectable
-    server-side (esp. the Gemini coding round, which runs entirely in the browser)."""
+    """Mirror the browser's on-screen log to a file so it's inspectable server-side
+    (esp. the Gemini coding round, which runs entirely in the browser). Writes to the
+    current run's per-session folder AND the rolling top-level client.log."""
+    line = req.line.rstrip()[:2000] + "\n"
     try:
         os.makedirs(get_settings().data_dir, exist_ok=True)
         with open(os.path.join(get_settings().data_dir, "client.log"), "a", encoding="utf-8") as f:
-            f.write(req.line.rstrip()[:2000] + "\n")
+            f.write(line)
+        if _session_log_dir:
+            with open(os.path.join(_session_log_dir, "client.log"), "a", encoding="utf-8") as f:
+                f.write(line)
     except Exception:
         pass
     return {"status": "ok"}
@@ -338,6 +399,22 @@ def session_interrupt():
         raise HTTPException(409, "no active session")
     interrupted = _pipeline.request_interrupt()
     return {"status": "ok", "interrupted": interrupted}
+
+
+@app.post("/session/finish-turn")
+def session_finish_turn():
+    """Candidate pressed 'Done' — finalize their turn now, skip the wait."""
+    if _pipeline is None:
+        raise HTTPException(409, "no active session")
+    return {"status": "ok", "finalized": _pipeline.finish_turn()}
+
+
+@app.post("/session/redo")
+def session_redo():
+    """Candidate pressed 'Talk again' — drop the misheard turn and listen again."""
+    if _pipeline is None:
+        raise HTTPException(409, "no active session")
+    return {"status": "ok", "redone": _pipeline.request_redo()}
 
 
 @app.post("/session/conclude", response_model=InterviewReport)
