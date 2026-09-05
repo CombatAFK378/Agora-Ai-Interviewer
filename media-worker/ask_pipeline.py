@@ -28,7 +28,7 @@ from pipeline import MIN_SPEECH_RMS, _is_filler, _rms
 # timeout) — the manual "Done" model is candidate-only. Own constants so the
 # interview pipeline can change its turn logic without affecting this.
 PENDING_MAX_SECS = 30.0
-PENDING_TIMEOUT_SECS = 4.0
+PENDING_TIMEOUT_SECS = 2.0   # commit the recruiter's question after this much silence
 from shared import ask_panel, prompts, store
 from shared.config import Settings
 from shared.models import REC_DECLINE, REC_PROCEED, REC_PROCEED_FLAGGED
@@ -54,22 +54,45 @@ _REJECT_PHRASES = (
 )
 _ACCEPT_WORDS = ("accept", "select", "hire", "proceed", "approve", "go ahead", "move forward")
 _REJECT_WORDS = ("reject", "decline", "pass", "drop")
-_FLAG_WORDS = ("with flags", "with a flag", "flagged", "with caution")
+
+# A question mentioning "reject the candidate" ("why did you reject the candidate?")
+# is NOT an override command. If any of these interrogative signals appear, we
+# treat the utterance as a question and never override on it. This was the bug:
+# "why did he reject the candidate" matched _REJECT_PHRASES and flipped the record.
+_QUESTION_SIGNALS = (
+    "?", "why did", "why do", "why is", "why was", "why are", "why does", "why would",
+    "what are", "what is", "what was", "what were", "what do", "what did", "what about",
+    "how did", "how do", "how does", "how was", "how come",
+    "when did", "which ", "who ", "where ",
+    "tell me", "explain", "walk me through", "talk about", "his weakness", "her weakness",
+    "weaknesses", "his strength", "her strength", "score so low", "so low",
+)
+
+
+def _looks_like_question(t: str) -> bool:
+    """A question / request for information — never an override command."""
+    return any(sig in t for sig in _QUESTION_SIGNALS)
 
 
 def _detect_override(text: str):
-    """Return (decision, reason) if the recruiter clearly commanded an override,
-    else None. A bare 'override' with no direction returns None so the panel can
-    ask which way to go."""
+    """Return (decision, reason) ONLY if the recruiter clearly *commanded* an
+    override (decline or proceed — no other states), else None.
+
+    Guards: a bare 'override' with no direction returns None (the panel asks which
+    way); a *question* that merely mentions accept/reject ('why did you reject the
+    candidate?') returns None so the panel answers instead of flipping the record."""
     t = text.lower()
+    if _looks_like_question(t):
+        return None
     trig = any(w in t for w in _OVERRIDE_TRIGGERS)
     accept = any(p in t for p in _ACCEPT_PHRASES) or (trig and any(w in t for w in _ACCEPT_WORDS))
     reject = any(p in t for p in _REJECT_PHRASES) or (trig and any(w in t for w in _REJECT_WORDS))
+    # Override is binary: DECLINE or PROCEED. (No PROCEED_FLAGGED from voice —
+    # the recruiter is making a clean call.)
     if reject and not accept:
         return REC_DECLINE, text[:500]
     if accept and not reject:
-        dec = REC_PROCEED_FLAGGED if any(f in t for f in _FLAG_WORDS) else REC_PROCEED
-        return dec, text[:500]
+        return REC_PROCEED, text[:500]
     return None
 
 GREETING_DELAY_SECS = 1.2
@@ -80,7 +103,7 @@ BARGEIN_GRACE_SECS = 0.35
 # the panel's voice from the mic; the quiet residual that leaks through stays
 # below this, while the recruiter's direct voice is well above it — so you can
 # interrupt on speakers without the panel echo-interrupting itself. int16 scale.
-BARGEIN_MIN_RMS = 1300.0
+BARGEIN_MIN_RMS = 900.0   # easier to cut the panel off (was 1300 — needed shouting)
 
 
 class AskPipeline:
@@ -142,7 +165,7 @@ class AskPipeline:
                 continue
             # Track recent loudness (decaying peak) so barge-in can require a loud
             # voice, not quiet post-AEC echo residue.
-            self._recent_rms = max(_rms(pcm), self._recent_rms * 0.7)
+            self._recent_rms = max(_rms(pcm), self._recent_rms * 0.85)
             # Feed the VAD even while the panel is speaking, so the recruiter can
             # barge in (_on_bargein stops the answer); their words then become the
             # next question.
@@ -153,11 +176,14 @@ class AskPipeline:
                 self._check_pending()
 
     def _on_utterance(self, utterance: bytes):
+        # Don't commit on Smart Turn's "complete" — it fires mid-sentence and cut the
+        # recruiter's question off, garbling the transcript. Accumulate and commit on a
+        # generous silence timeout instead, so the whole question is captured.
         combined = bytes(self._pending) + utterance
-        self._pending_since = None
         capped = len(combined) >= int(PENDING_MAX_SECS * self.sample_rate * 2)
-        if capped or self.smart_turn.is_complete(combined):
+        if capped:
             self._pending = bytearray()
+            self._pending_since = None
             self._handle(combined)
         else:
             self._pending = bytearray(combined)
@@ -257,8 +283,23 @@ class AskPipeline:
             # never dropped to a flaky LLM tool-call.
             ov_intent = _detect_override(text)
             if ov_intent is not None:
-                decision, reason = ov_intent
-                ov = ask_panel.override(self.record, decision, reason)
+                decision, _reason = ov_intent
+                current = self.record.report.conclusion.recommendation
+                proceed_now = current in (REC_PROCEED, REC_PROCEED_FLAGGED)
+                # Override only flips the record to the OTHER state. If it's already
+                # there ("decline the candidate" when already declined), it's a no-op
+                # — don't announce a bogus override; answer the question instead.
+                already = (decision == REC_DECLINE and not proceed_now) or \
+                          (decision == REC_PROCEED and proceed_now)
+                if already:
+                    state = "declined" if not proceed_now else "cleared to proceed"
+                    logger.info("ask: override to %s ignored — already %s", decision, current)
+                    self._speak("orchestrator",
+                                f"The panel has already {state} this candidate, so there's "
+                                "nothing to flip. If you want to reverse that, tell me to "
+                                f"{'proceed with' if not proceed_now else 'decline'} the candidate.")
+                    return
+                ov = ask_panel.override(self.record, decision, _reason)
                 try:                       # persist so the dashboard reflects it (§11)
                     store.save_record(self.record)
                 except Exception:

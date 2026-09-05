@@ -2,7 +2,9 @@
 // screen to Gemini Live and plays Liam's voice back, all client-side. The server
 // only mints the ephemeral token and receives the final verdict. Isolated from the
 // Agora panel — this runs only during the locked coding phase.
-import { GoogleGenAI, Modality, Type, ActivityHandling } from "@google/genai";
+import {
+  GoogleGenAI, Modality, Type, ActivityHandling, StartSensitivity, EndSensitivity,
+} from "@google/genai";
 
 const FINISH_TOOL = {
   functionDeclarations: [
@@ -201,12 +203,18 @@ export async function startGeminiCoding({
       speechConfig: {
         voiceConfig: { prebuiltVoiceConfig: { voiceName: "Charon" } },
       },
-      // Don't let ambient sound (your voice, thinking out loud, echo) cut Liam off
-      // mid-sentence. He still HEARS you — he just finishes his short remark before
-      // responding, instead of flushing his audio on every noise. Default turn
-      // detection otherwise, so he's still responsive when he's not speaking.
+      // Don't let ambient sound cut Liam off mid-sentence (NO_INTERRUPTION), AND make
+      // his speech detection LOW-sensitivity with a longer silence window so quiet
+      // background voices / room noise don't register as the candidate talking and
+      // trigger a reply. He still responds to clear, direct speech.
       realtimeInputConfig: {
         activityHandling: ActivityHandling.NO_INTERRUPTION,
+        automaticActivityDetection: {
+          startOfSpeechSensitivity: StartSensitivity.START_SENSITIVITY_LOW,
+          endOfSpeechSensitivity: EndSensitivity.END_SENSITIVITY_LOW,
+          prefixPaddingMs: 300,
+          silenceDurationMs: 1000,
+        },
       },
     },
     callbacks: {
@@ -232,7 +240,11 @@ export async function startGeminiCoding({
               if (p.text) log("liam(text): " + p.text.slice(0, 80));
             }
           }
-          if (msg.serverContent?.interrupted) { log("interrupted → flush queue"); stopPlayback(); }
+          // Do NOT flush on `interrupted`. With NO_INTERRUPTION Liam shouldn't be cut
+          // off, but Gemini still emits this signal whenever it hears the candidate or
+          // background noise — flushing here chopped his audio to "one word then stops."
+          // We let his current line finish; he replies on his next turn.
+          if (msg.serverContent?.interrupted) log("interrupted signal (ignored — letting Liam finish)");
           if (msg.serverContent?.turnComplete) {
             log(`turn complete (msgs=${msgCount}, audio=${audioChunks}, mic=${micChunks}, frames=${frameCount})`);
             onSpeaking && onSpeaking(false);
